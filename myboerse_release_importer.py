@@ -50,7 +50,7 @@ class Release:
         return self.title.strip()
 
 def clean_title(value: str) -> str:
-    return re.sub(r"\\s+", " ", value).strip(" \\t\\r\\n|")
+    return re.sub(r"\s+", " ", value).strip(" \t\r\n|")
 
 def is_filecrypt_container(url: str) -> bool:
     p = urlparse(url)
@@ -61,6 +61,7 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
         wrapper = article.select_one(".bbWrapper")
         if not wrapper: continue
         for node in wrapper.select("b, strong"):
+            # print(f"extract_release_title: node.get_text: " + repr(node.get_text(" ", strip=True)))
             candidate = clean_title(node.get_text(" ", strip=True))
             if candidate and len(candidate) >= 3 and not re.search(r"^(?:download|screenshots?|nfo|mediainfo|passwort|password)\\s*:?$", candidate, re.I):
                 return candidate, "message-bold"
@@ -84,6 +85,7 @@ def parse_html_file(path: Path) -> Release | None:
         LOG.exception("Cannot read %s", path); return None
     soup = BeautifulSoup(html, "html.parser")
     title, source = extract_release_title(soup)
+    # print(f"parse_html_file: title={title!r}, source={source!r}")
     links = extract_filecrypt_links(soup)
     if not title:
         LOG.warning("No release title found in %s", path); return None
@@ -92,6 +94,7 @@ def parse_html_file(path: Path) -> Release | None:
     try: parsed = guessit(title); guessit_data = {str(k): str(v) for k, v in parsed.items()}
     except Exception:
         LOG.exception("GuessIt failed for %r", title); guessit_data = {}
+    # print(f"parse_html_file: title={title!r}")
     return Release(str(path), title, source or "unknown", links, guessit_data)
 
 def parse_archive(root: Path) -> list[Release]:
