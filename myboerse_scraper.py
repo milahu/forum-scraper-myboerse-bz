@@ -102,9 +102,10 @@ async def member_search_url(page, member_url: str) -> str:
 async def extract_thread_links(page) -> list[str]:
     # XenForo 2 thread list. Limit links to actual thread titles, not last-post links.
     selectors = [
-        ".structItem--thread .structItem-title a[href*='/threads/']",
-        ".structItem-title a[href*='/threads/']",
-        ".searchResult-title a[href*='/threads/']",
+        # ".structItem--thread .structItem-title a[href*='/threads/']",
+        # ".structItem-title a[href*='/threads/']",
+        # ".searchResult-title a[href*='/threads/']",
+        "ol.block-body > li.block-row > div.contentRow > div.contentRow-main > h3.contentRow-title > a",
     ]
     for selector in selectors:
         print(f"extract_thread_links: selector={selector!r}")
