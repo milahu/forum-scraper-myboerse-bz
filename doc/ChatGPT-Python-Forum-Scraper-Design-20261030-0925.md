@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 2026/10/30 9:22:40  
-**Updated:** 2026/10/30 9:23:51  
-**Exported:** 2026/10/30 9:25:43  
+**Updated:** 2026/10/31 14:59:57  
+**Exported:** 2026/10/31 15:06:55  
 **Link:** [<https://chatgpt.com/c/6ae453d0-226c-83eb-9ab0-8b8e041b7f5e>](https://chatgpt.com/c/6ae453d0-226c-83eb-9ab0-8b8e041b7f5e)
 
 ## Prompt:
@@ -179,6 +179,114 @@ Before expanding the scraper to other URL types, I'd verify these three things:
 3.  **HTML quality:** open a saved thread offline and check that its title, post content and Filecrypt links are present. The current version saves the complete HTML document, but it doesn't download external images, stylesheets or other assets for fully self-contained offline viewing.
 
 One important distinction: the current version saves thread HTML, not the contents hosted behind Filecrypt. We can add Filecrypt link extraction or a separate download workflow later if you need it.
+
+## Prompt:
+
+10/31/2026, 2:59:01 PM
+
+ok, now i need a python script that parses all downloaded HTML files of release threads, extracts the release title and the filecrypt.cc download link, and adds the download package to pyload
+
+for adding a download package to pyload, i already have this function:
+
+
+    async def submit_links_to_pyload(
+            links: Sequence[str],
+            package: str,
+            # *,
+            base_url: str = "http://localhost:9666",
+            autostart: bool = False,
+            passwords: str | None = None,
+            timeout: float = 15,
+        ) -> str:
+        """Submit URLs to pyLoad via its local Click'n'Load HTTP handlers.
+
+        Args:
+            links: URLs to add, one per line in the POST body.
+            package: Package name to assign.
+            base_url: Base URL of the pyLoad Click'n'Load listener.
+            autostart: add to the download queue.
+            passwords: Optional archive password string for /flash/add.
+            timeout: HTTP request timeout in seconds.
+
+        Returns:
+            The response body from pyLoad.
+
+        Raises:
+            ValueError: If no valid links are supplied.
+            requests.HTTPError: If pyLoad returns an HTTP error.
+            requests.RequestException: If the request fails.
+        """
+
+        clean_links = [
+            link.strip()
+            for link in links
+            if link and link.strip()
+        ]
+        if not clean_links:
+            raise ValueError("links must contain at least one URL")
+
+        form_data = {
+            "urls": "\n".join(clean_links),
+            "package": package.strip(),
+        }
+
+        # flashgot only
+        # form_data["autostart"] = "1" if autostart else "0"
+
+        if passwords:
+            form_data["passwords"] = passwords
+
+        response = requests.post(
+            # base_url.rstrip('/') + "/flashgot", # no "passwords" field
+            base_url.rstrip('/') + "/flash/add",
+            data=form_data,
+            # headers={"Referer": "http://localhost:9666/flashgot"}, # only for flashgot
+            timeout=timeout,
+        )
+        response.raise_for_status()
+
+        body = response.text.strip()
+        if body.startswith("failed"):
+            raise RuntimeError(f"pyLoad rejected the links: {body}")
+
+        return body
+
+for example, the release name "Forever.S01.GERMAN.AAC.1080p.WEB.x265-w00t" should be parsed from this HTML:
+
+
+    <article class="message-body js-selectToQuote">
+
+    <div>
+
+              <div class="bbWrapper"><div style="text-align: center"><span style="font-size: 12px"><b>Forever.S01.GERMAN.AAC.1080p.WEB.x265-w00t</b><br>
+
+if that HTML is not found, the script should fall back to parsing the release name "Forever 2014 S01 GERMAN AAC 1080p WEB x265 - w00t" from this HTML:
+
+      <title>Forever 2014 S01 GERMAN AAC 1080p WEB x265 - w00t | MyBoerse.bz - Warez &amp; XXX Download Board Forum - Boerse.to Nachfolger Alternative</title>
+
+the script should extract all filecrypt.cc download links from HTML like
+
+    <a href="https://filecrypt.cc/Container/321A0D8CA3.html" target="_blank" class="link link--external" rel="nofollow ugc noopener">
+
+the script should also parse release names with the `guessit` library, so later i can filter by video resolution (for example "only download 720p releases"). generally, the script should be designed so it first builds a list of all releases, then the user can add some code to filter the releases, and then the filtered list of releases is added to pyload
+
+also the script should write logfiles of releases that have already been added to pyload, to avoid re-adding releases to pyload in future runs
+
+## Response:
+
+10/31/2026, 2:59:02 PM
+
+I've prepared the starter project for the HTML-to-pyLoad importer.
+
+[Download the Python importer ZIP](sandbox:/mnt/data/myboerse_release_importer.zip)
+
+It includes the parser, GuessIt integration, a filtering hook, pyLoad submission, and a JSONL history file for skipping previously submitted releases.
+
+**Important limitation:** I wasn't able to complete the final code inspection, so please treat this as an unverified starter rather than a tested, ready-to-run script. Python data analysis is temporarily unavailable in this session; it may become available again in about 24 hours, though that isn't guaranteed.
+
+When testing, start with a dry run:
+
+Review the parsed titles, GuessIt metadata, and Filecrypt links before running it against pyLoad.
 
 ------------------------------------------------------------------------
 
