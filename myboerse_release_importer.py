@@ -123,7 +123,7 @@ def append_history(path: Path, release: Release, response: str) -> None:
         f.flush()
 
 def submit_links_to_pyload(links: Sequence[str], package: str, *, base_url: str = "http://localhost:9666",
-                           autostart: bool = False, passwords: str | None = None, timeout: float = 15) -> str:
+                           passwords: str | None = None, timeout: float = 15) -> str:
     clean_links = [x.strip() for x in links if x and x.strip()]
     if not clean_links: raise ValueError("links must contain at least one URL")
     data = {"urls": "\\n".join(clean_links), "package": package.strip()}
@@ -149,7 +149,6 @@ def main() -> int:
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
     p.add_argument("--dry-run", action="store_true", help="List candidates without submitting")
-    p.add_argument("--autostart", action="store_true", help="Compatibility option; Click'n'Load handler may ignore this")
     p.add_argument("--passwords", help="Optional archive password string passed to pyLoad")
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--json-out", help="Write parsed release inventory as JSON")
@@ -180,7 +179,7 @@ def main() -> int:
     for r in pending:
         try:
             response = submit_links_to_pyload(r.filecrypt_links, r.package_name, base_url=args.pyload_url,
-                                               autostart=args.autostart, passwords=args.passwords, timeout=args.timeout)
+                                               passwords=args.passwords, timeout=args.timeout)
         except Exception:
             LOG.exception("Failed to submit %r; it will be retried next run.", r.title); continue
         append_history(history_path, r, response)
