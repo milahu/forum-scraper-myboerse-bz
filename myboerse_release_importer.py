@@ -144,7 +144,7 @@ def filter_releases(releases: list[Release], args) -> list[Release]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--archive", required=True, help="Directory containing archived thread HTML")
+    p.add_argument("--archive", default="archive", help="Directory containing archived thread HTML")
     p.add_argument("--history", default="pyload_added.jsonl", help="JSONL history of successful submissions")
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
