@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
 from patchright.async_api import async_playwright
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 BASE_HOST = "myboerse.bz"
 LOG = logging.getLogger("myboerse_scraper")
