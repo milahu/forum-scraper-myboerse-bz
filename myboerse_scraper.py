@@ -107,11 +107,14 @@ async def extract_thread_links(page) -> list[str]:
         ".searchResult-title a[href*='/threads/']",
     ]
     for selector in selectors:
+        print(f"extract_thread_links: selector={selector!r}")
         loc = page.locator(selector)
         if await loc.count():
+            print(f"extract_thread_links: found {await loc.count()} elements")
             found = []
             for i in range(await loc.count()):
                 href = await loc.nth(i).get_attribute("href")
+                print(f"extract_thread_links: href={href!r}")
                 if href:
                     full = urljoin(page.url, href)
                     if thread_id_from_url(full):
@@ -138,6 +141,7 @@ async def find_next_page(page) -> str | None:
 
 async def scrape_member(page, member_url: str, output: Path, delay: float) -> None:
     search_url = await member_search_url(page, member_url)
+    print(f"scrape_member: search_url={search_url!r}")
     seen_search_pages: set[str] = set()
     downloaded = skipped = 0
     current = search_url
@@ -149,6 +153,7 @@ async def scrape_member(page, member_url: str, output: Path, delay: float) -> No
         await page.locator("body").wait_for()
         # If the forum's search endpoint redirects, page.url is the canonical result page.
         current = page.url
+        print(f"scrape_member: page.url={page.url!r}")
         thread_urls = await extract_thread_links(page)
         if not thread_urls:
             title = (await page.title()).strip()
