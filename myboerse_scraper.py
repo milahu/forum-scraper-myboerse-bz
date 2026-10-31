@@ -235,6 +235,7 @@ async def async_main(args) -> int:
                 )
         except Exception as exc:
             if 1:
+                print(f"got exception: {type(exc).__name__}: {exc}")
                 print("keeping browser open for debugging")
                 await asyncio.sleep(99999)
             raise
