@@ -232,6 +232,11 @@ async def async_main(args) -> int:
                     "This first version implements member URLs only. Other start URL types "
                     "are intentionally reserved for future handlers."
                 )
+        except Exception as exc:
+            if 1:
+                print("keeping browser open for debugging")
+                await asyncio.sleep(99999)
+            raise
         finally:
             await context.close()
             await browser.close()
