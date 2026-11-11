@@ -36,18 +36,17 @@ FILECRYPT_HOSTS = {"filecrypt.cc", "www.filecrypt.cc"}
 @dataclass
 class Release:
     source_file: str
+    thread_id: int
     title: str
     title_source: str
     filecrypt_links: list[str]
     guessit: dict[str, Any] = field(default_factory=dict)
     @property
     def key(self) -> str:
-        title = re.sub(r"\s+", " ", self.title).strip().casefold()
-        material = title + "\n" + "\n".join(sorted(set(self.filecrypt_links)))
-        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return f"t{self.thread_id}"
     @property
     def package_name(self) -> str:
-        return self.title.strip()
+        return f"{self.title.strip()} (t{self.thread_id})"
 
 def clean_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" \t\r\n|")
@@ -55,6 +54,36 @@ def clean_title(value: str) -> str:
 def is_filecrypt_container(url: str) -> bool:
     p = urlparse(url)
     return p.scheme in {"http", "https"} and (p.hostname or "").lower() in FILECRYPT_HOSTS and "/container/" in p.path.lower()
+
+
+def extract_thread_id(path: Path, soup: BeautifulSoup) -> int | None:
+    # Primary source: HTML filename, e.g. 1836094.html
+    filename_id = (
+        int(path.stem)
+        if path.stem.isdecimal()
+        else None
+    )
+
+    # Secondary source: <html data-content-key="thread-1836094">
+    html_tag = soup.find("html")
+    content_key = (
+        html_tag.get("data-content-key", "")
+        if html_tag
+        else ""
+    )
+
+    match = re.fullmatch(r"thread-(\d+)", content_key)
+    content_id = int(match.group(1)) if match else None
+
+    if filename_id is not None and content_id is not None:
+        if filename_id != content_id:
+            raise ValueError(
+                f"Thread ID mismatch in {path}: "
+                f"filename={filename_id}, HTML={content_id}"
+            )
+
+    return filename_id if filename_id is not None else content_id
+
 
 def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     # articles container:
@@ -120,6 +149,10 @@ def parse_html_file(path: Path) -> Release | None:
     except OSError:
         LOG.exception("Cannot read %s", path); return None
     soup = BeautifulSoup(html, "html.parser")
+    thread_id = extract_thread_id(path, soup)
+    if thread_id is None:
+        LOG.warning("No thread ID found in %s", path)
+        return None
     title, source = extract_release_title(soup)
     bad_titles = (
         "bitte löschen",
@@ -136,7 +169,15 @@ def parse_html_file(path: Path) -> Release | None:
         LOG.exception("GuessIt failed for %r", title); guessit_data = {}
     # print(f"parse_html_file: title={title!r}")
     print(f"parse_html_file: path={path} title={title!r}")
-    return Release(str(path), title, source or "unknown", links, guessit_data)
+    return Release(
+        source_file=str(path),
+        thread_id=thread_id,
+        title=title,
+        title_source=source or "unknown",
+        filecrypt_links=links,
+        guessit=guessit_data,
+    )
+
 
 def parse_archive(root: Path) -> list[Release]:
     releases = []
