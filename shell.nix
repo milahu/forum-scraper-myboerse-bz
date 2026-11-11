@@ -17,6 +17,8 @@ mkShell {
       # playwright
       # rapidfuzz
       guessit
+      nur.repos.milahu.python3.pkgs.camoufox
+      cryptography
     ]))
   ];
 
@@ -24,4 +26,5 @@ mkShell {
   # https://github.com/NixOS/nixpkgs/issues/268004
   # Package Python Playwright with Browser
   PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.passthru.browsers}";
+  FIREFOX_ADDON_DARKREADER = nur.repos.milahu.python3.pkgs.camoufox.firefox-addons.darkreader;
 }
