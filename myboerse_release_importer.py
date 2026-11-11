@@ -35,6 +35,9 @@ import requests
 from bs4 import BeautifulSoup
 from guessit import guessit
 
+import unicodedata
+from rapidfuzz import fuzz, process
+
 sys.path.insert(0, os.path.dirname(__file__) + "/src/filecrypt-scraper-camoufox/src")
 from filecrypt_scraper import decrypt_packages, unique
 
@@ -265,12 +268,185 @@ def submit_links_to_pyload(links: Sequence[str], package: str, *, base_url: str 
     if body.startswith("failed"): raise RuntimeError(f"pyLoad rejected the links: {body}")
     return body
 
+
+
+@dataclass(frozen=True)
+class WantedMovie:
+    title: str
+    normalized_title: str
+    year: int | None
+    original_release: str
+
+
+def normalize_movie_title(title: str) -> str:
+    """Normalize movie titles for punctuation-insensitive matching."""
+    title = unicodedata.normalize("NFKD", title.casefold())
+
+    # Remove accents, e.g. "Amélie" -> "amelie".
+    title = "".join(
+        c for c in title
+        if not unicodedata.combining(c)
+    )
+
+    # Treat punctuation and separators as spaces.
+    title = re.sub(r"[^a-z0-9]+", " ", title)
+
+    return " ".join(title.split())
+
+
+def load_wanted_movies(path: Path) -> list[WantedMovie]:
+    """Parse the wanted release names into movie titles."""
+    movies = []
+    seen = set()
+
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8-sig").splitlines(), 1
+    ):
+        release_name = line.strip()
+
+        if not release_name or release_name.startswith("#"):
+            continue
+
+        try:
+            # Force movie parsing for the wanted list.
+            parsed = guessit(
+                release_name,
+                options={"type": "movie"},
+            )
+
+            title = str(parsed.get("title", "")).strip()
+            year = parsed.get("year")
+
+            if not title:
+                LOG.warning(
+                    "No movie title on line %d: %s",
+                    line_number, release_name,
+                )
+                continue
+
+            normalized = normalize_movie_title(title)
+            if not normalized:
+                continue
+
+            year = int(year) if year is not None else None
+            key = (normalized, year)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            movies.append(WantedMovie(
+                title=title,
+                normalized_title=normalized,
+                year=year,
+                original_release=release_name,
+            ))
+
+        except Exception:
+            LOG.exception(
+                "Failed parsing wanted movie on line %d: %s",
+                line_number, release_name,
+            )
+
+    LOG.info("Loaded %d wanted movies from %s", len(movies), path)
+    return movies
+
+
+def find_wanted_movie(
+        release: Release,
+        wanted_movies: list[WantedMovie],
+        threshold: float = 90.0,
+    ) -> tuple[WantedMovie, float] | None:
+    """Return the best matching wanted movie and similarity score."""
+
+    metadata = release.guessit
+
+    # Reject TV series.
+    if str(metadata.get("type", "")).casefold() == "episode":
+        return None
+
+    # Also reject releases containing season/episode metadata.
+    if "season" in metadata or "episode" in metadata:
+        return None
+
+    title = str(metadata.get("title", "")).strip()
+    if not title:
+        return None
+
+    normalized = normalize_movie_title(title)
+    if not normalized:
+        return None
+
+    raw_year = metadata.get("year")
+    release_year = int(raw_year) if raw_year is not None else None
+
+    # Only compare movies with compatible years.
+    candidates = [
+        movie for movie in wanted_movies
+        if (
+            release_year is None
+            or movie.year is None
+            or release_year == movie.year
+        )
+    ]
+
+    if not candidates:
+        return None
+
+    # Fast path: exact normalized title match.
+    for movie in candidates:
+        if normalized == movie.normalized_title:
+            return movie, 100.0
+
+    # Fuzzy path: find best title similarity.
+    result = process.extractOne(
+        normalized,
+        [movie.normalized_title for movie in candidates],
+        scorer=fuzz.ratio,
+        score_cutoff=threshold,
+    )
+
+    if result is None:
+        return None
+
+    _, score, index = result
+    return candidates[index], score
+
+
 def filter_releases(releases: list[Release], args) -> list[Release]:
     """Customization point: add user-specific filters here."""
     selected = releases
     if args.resolution:
         wanted = args.resolution.casefold()
         selected = [r for r in selected if str(r.guessit.get("screen_size", "")).casefold() == wanted or wanted in r.title.casefold()]
+    if args.wanted_movies:
+        wanted_movies = load_wanted_movies(
+            Path(args.wanted_movies).expanduser()
+        )
+        if not wanted_movies:
+            LOG.warning("Wanted movie list is empty")
+            return []
+        matched = []
+        for release in selected:
+            result = find_wanted_movie(
+                release,
+                wanted_movies,
+                threshold=args.movie_match_threshold,
+            )
+            if result is None:
+                continue
+            movie, score = result
+            LOG.info(
+                "Movie match (%.1f%%): %s -> %s (%s)",
+                score,
+                release.title,
+                movie.title,
+                movie.year,
+            )
+            matched.append(release)
+        selected = matched
+        LOG.info("Wanted movie filter: %d matching releases", len(selected))
     return selected
 
 
@@ -547,7 +723,25 @@ def main() -> int:
         default=180,
         help="Maximum time to wait for a browser challenge",
     )
+    p.add_argument(
+        "--wanted-movies",
+        type=Path,
+        help="Text file containing wanted movie release names",
+    )
+    p.add_argument(
+        "--movie-match-threshold",
+        type=float,
+        default=90.0,
+        help="Minimum fuzzy movie title similarity (0-100, default: 90)",
+    )
     args = p.parse_args()
+    # print(f"args={args}")
+    for key, val in args.__dict__.items():
+        print(f"args.{key}={val!r}")
+    if not 0 <= args.movie_match_threshold <= 100:
+        p.error("--movie-match-threshold must be between 0 and 100")
+    if args.wanted_movies and not args.wanted_movies.expanduser().is_file():
+        p.error(f"Wanted movie file does not exist: {args.wanted_movies}")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     archive = Path(args.archive).expanduser()
     if not archive.is_dir(): p.error(f"archive directory does not exist: {archive}")
@@ -565,10 +759,10 @@ def main() -> int:
     history_path = Path(args.history).expanduser()
     history = load_history(history_path)
     pending = [r for r in selected if r.key not in history]
-    if args.limit and args.limit > len(pending):
+    LOG.info("%d releases not in submission history.", len(pending))
+    if args.limit and args.limit < len(pending):
         print(f"limiting pending releases from {len(pending)} to {args.limit}")
         pending = pending[:args.limit]
-    LOG.info("%d releases not in submission history.", len(pending))
     for r in pending: LOG.info("Candidate: %s | GuessIt=%s | links=%s", r.title, r.guessit, ", ".join(r.filecrypt_links))
     if args.dry_run:
         LOG.info("Dry run: nothing submitted."); return 0

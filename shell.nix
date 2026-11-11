@@ -15,7 +15,7 @@ mkShell {
       # playwright
       nur.repos.milahu.python3.pkgs.patchright
       # playwright
-      # rapidfuzz
+      rapidfuzz
       guessit
       nur.repos.milahu.python3.pkgs.camoufox
       cryptography
