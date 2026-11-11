@@ -138,9 +138,22 @@ def parse_html_file(path: Path) -> Release | None:
 
 def parse_archive(root: Path) -> list[Release]:
     releases = []
-    for path in sorted(root.rglob("*.html")):
+
+    debug_stop_after_n_releases = None
+    # debug_stop_after_n_releases = 10
+    n = 0
+
+    paths = sorted(root.rglob("*.html"))
+    # paths = [Path("archive/myboerse/1636873.html")] # debug: "bitte löschen"
+    # paths = [Path("archive/myboerse/2868879.html")] # debug: "Haunted.Hotel.S02.GERMAN.AAC.720p.WEB.x265-w00t"
+
+    for path in paths:
         release = parse_html_file(path)
         if release: releases.append(release)
+        if debug_stop_after_n_releases and release:
+            n += 1
+            if n > debug_stop_after_n_releases:
+                break
     return releases
 
 def load_history(path: Path) -> dict[str, dict[str, Any]]:
