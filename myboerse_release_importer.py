@@ -42,8 +42,8 @@ class Release:
     guessit: dict[str, Any] = field(default_factory=dict)
     @property
     def key(self) -> str:
-        title = re.sub(r"\\s+", " ", self.title).strip().casefold()
-        material = title + "\\n" + "\\n".join(sorted(set(self.filecrypt_links)))
+        title = re.sub(r"\s+", " ", self.title).strip().casefold()
+        material = title + "\n" + "\n".join(sorted(set(self.filecrypt_links)))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
     @property
     def package_name(self) -> str:
@@ -68,7 +68,7 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     title_tag = soup.find("title")
     if title_tag:
         full = clean_title(title_tag.get_text(" ", strip=True))
-        candidate = clean_title(re.split(r"\\s*\\|\\s*MyBoerse\\.bz\\b", full, maxsplit=1, flags=re.I)[0])
+        candidate = clean_title(re.split(r"\s*\|\s*MyBoerse\.bz\b", full, maxsplit=1, flags=re.I)[0])
         if candidate: return candidate, "page-title"
     return None, None
 
@@ -122,14 +122,14 @@ def append_history(path: Path, release: Release, response: str) -> None:
               "filecrypt_links": release.filecrypt_links, "pyload_response": response,
               "added_at": datetime.now(timezone.utc).isoformat()}
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\\n")
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
 
 def submit_links_to_pyload(links: Sequence[str], package: str, *, base_url: str = "http://localhost:9666",
                            passwords: str | None = None, timeout: float = 15) -> str:
     clean_links = [x.strip() for x in links if x and x.strip()]
     if not clean_links: raise ValueError("links must contain at least one URL")
-    data = {"urls": "\\n".join(clean_links), "package": package.strip()}
+    data = {"urls": "\n".join(clean_links), "package": package.strip()}
     if passwords: data["passwords"] = passwords
     response = requests.post(base_url.rstrip("/") + "/flash/add", data=data, timeout=timeout)
     response.raise_for_status()
