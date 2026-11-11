@@ -57,18 +57,53 @@ def is_filecrypt_container(url: str) -> bool:
     return p.scheme in {"http", "https"} and (p.hostname or "").lower() in FILECRYPT_HOSTS and "/container/" in p.path.lower()
 
 def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
-    for article in soup.select("article.message-body.js-selectToQuote, article.message-body"):
-        wrapper = article.select_one(".bbWrapper")
-        if not wrapper: continue
-        for node in wrapper.select("b, strong"):
-            # print(f"extract_release_title: node.get_text: " + repr(node.get_text(" ", strip=True)))
-            candidate = clean_title(node.get_text(" ", strip=True))
-            if candidate and len(candidate) >= 3 and not re.search(r"^(?:download|screenshots?|nfo|mediainfo|passwort|password)\\s*:?$", candidate, re.I):
-                return candidate, "message-bold"
+    # articles container:
+    # /html/body/div[1]/div[4]/div/div[4]/div[2]/div/div[3]/div[3]/div
+    # <div class="p-body-content"
+    #  <div class="p-body-pageContent"
+    #   <div class="block block--messages"
+    #    <div class="block-container lbContainer"
+    #     <div class="block-body js-replyNewMessageContainer">
+    # article element:
+    # <article class="message message--post js-post js-inlineModContainer  " id="js-post-5913241"
+    #  <div class="message-inner"
+    #   <div class="message-cell message-cell--main"
+    #    <div class="message-main js-quickEditTarget"
+    #     <div class="message-content js-messageContent"
+    #      <div class="message-userContent lbContainer js-lbContainer "
+    #       <article class="message-body js-selectToQuote"
+    #        <div>
+    #         <div class="bbWrapper"
+
+    # NOTE use only the first article element = first post in the thread
+    # other posts are "reups" = reuploads of the same content by different users
+    bold_selector = "div.block-body > article.message:nth-child(1) > div.message-inner > div.message-cell > div.message-main > div.message-content > div.message-userContent > article.message-body > div:nth-child(1) > div.bbWrapper b:nth-child(1)"
+    for node in soup.select(bold_selector):
+        # print(f"extract_release_title: node.name={node.name}")
+        # print(f"extract_release_title: node:\n{node}")
+        # if node.name not in ("b", "strong"): continue
+        # print(f"extract_release_title: node.get_text: " + repr(node.get_text(" ", strip=True)))
+        candidate = clean_title(node.get_text(" ", strip=True))
+        # print(f"extract_release_title: candidate={candidate!r}")
+        if candidate and len(candidate) >= 3 and not re.search(r"^(?:download|screenshots?|nfo|mediainfo|passwort|password)\s*:?$", candidate, re.I):
+            return candidate, "message-bold"
+
+    # <h1 class="p-title-value">Some Title</h1>
+    h1_selector = "h1.p-title-value"
+    h1_tag = soup.select_one(h1_selector)
+    if h1_tag:
+        # print(f"extract_release_title: h1_tag={h1_tag}")
+        candidate = clean_title(h1_tag.get_text(" ", strip=True))
+        # print(f"extract_release_title: candidate={candidate!r}")
+        if candidate: return candidate, "page-h1"
+    # else:
+    #     print(f"extract_release_title: no h1_tag")
+
     title_tag = soup.find("title")
     if title_tag:
         full = clean_title(title_tag.get_text(" ", strip=True))
         candidate = clean_title(re.split(r"\s*\|\s*MyBoerse\.bz\b", full, maxsplit=1, flags=re.I)[0])
+        # print(f"extract_release_title: candidate={candidate!r}")
         if candidate: return candidate, "page-title"
     return None, None
 
