@@ -1,0 +1,3 @@
+[submodule "src/filecrypt-scraper-camoufox"]
+	path = src/filecrypt-scraper-camoufox
+	url = https://github.com/milahu/filecrypt-scraper-camoufox
