@@ -120,6 +120,10 @@ def parse_html_file(path: Path) -> Release | None:
         LOG.exception("Cannot read %s", path); return None
     soup = BeautifulSoup(html, "html.parser")
     title, source = extract_release_title(soup)
+    bad_titles = (
+        "bitte löschen",
+    )
+    if title in bad_titles: return None
     # print(f"parse_html_file: title={title!r}, source={source!r}")
     links = extract_filecrypt_links(soup)
     if not title:
