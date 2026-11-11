@@ -136,7 +136,17 @@ async def find_next_page(page) -> str | None:
         if await loc.count():
             href = await loc.first.get_attribute("href")
             if href:
+                print(f"find_next_page: found next-page link href={href!r} with selector={selector!r}")
                 return urljoin(page.url, href)
+    if 1:
+        # debug
+        # last page?
+        html = await page.content()
+        html_path = "find_next_page.page.content.html"
+        print(f"find_next_page: writing {html_path!r}")
+        with open(html_path, "w") as f:
+            f.write(html)
+        print(f"find_next_page: found no next-page link on page page.url={page.url!r} html_path={html_path}")
     return None
 
 

@@ -115,6 +115,7 @@ def extract_filecrypt_links(soup: BeautifulSoup) -> list[str]:
     return links
 
 def parse_html_file(path: Path) -> Release | None:
+    # print(f"parse_html_file: path={path!r}")
     try: html = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         LOG.exception("Cannot read %s", path); return None
@@ -134,6 +135,7 @@ def parse_html_file(path: Path) -> Release | None:
     except Exception:
         LOG.exception("GuessIt failed for %r", title); guessit_data = {}
     # print(f"parse_html_file: title={title!r}")
+    print(f"parse_html_file: path={path} title={title!r}")
     return Release(str(path), title, source or "unknown", links, guessit_data)
 
 def parse_archive(root: Path) -> list[Release]:
