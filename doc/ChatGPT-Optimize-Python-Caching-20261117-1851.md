@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 2026/11/17 17:42:44  
-**Updated:** 2026/11/17 17:47:25  
-**Exported:** 2026/11/17 18:51:13  
+**Updated:** 2026/11/17 20:36:16  
+**Exported:** 2026/11/17 20:37:03  
 **Link:** [<https://chatgpt.com/c/6afc8403-d634-83ed-ab21-6be22c34fab7>](https://chatgpt.com/c/6afc8403-d634-83ed-ab21-6be22c34fab7)
 
 ## Prompt:
@@ -1084,6 +1084,302 @@ For large HTML documents, `lxml` is often substantially faster. Verify that your
 **My recommendation:** Start with the SQLite cache above. It gives you the largest likely improvement with minimal changes to the existing script. Keep the HTML parsing cache separate from `filecrypt_cache`, because the two caches have different keys, invalidation rules, and purposes.
 
 One further refinement worth considering is storing a `parse_status` column (`valid`, `no_title`, `no_links`, `read_error`) rather than representing every negative result as `NULL`. That would let you measure why files are rejected and ensure transient errors are never mistaken for permanently invalid releases.
+
+## Prompt:
+
+11/17/2026, 8:30:54 PM
+
+also help me fix this todo-comment
+
+`# TODO also write cache? -> dont retry broken URLs`
+
+in the function `process_releases`
+
+    def process_releases(
+            releases: list[Release],
+            args,
+            history_path: Path,
+            history: dict,
+        ) -> int:
+        failures = 0
+
+        with sqlite3.connect(args.cache_db) as db:
+            init_cache(db)
+
+            # State for each pending release.
+            states = {}
+
+            # we want to decrypt each container only once
+            # so we use container_url as the key for containers_to_decrypt
+            # containers_to_decrypt[container_url] = entry
+            # and each entry can have multiple package_names
+            #
+            # ideally, every container should have only one package
+            # but in the real world, the input data can be inconsistent
+            # so multiple packages can share the same container_url
+            containers_to_decrypt = {}
+
+            for release in releases:
+                if release.key in history or release.key in states:
+                    continue
+
+                # print(f"release {release}"); sys.exit() # debug
+
+                state = {
+                    "release": release,
+                    "urls": [],
+                    "remaining": 0,
+                    "failed": False,
+                }
+                states[release.key] = state
+
+                for container_url in unique(release.filecrypt_links):
+                    cached = get_cached_urls(db, container_url)
+
+                    if cached is not None:
+                        LOG.info("Cache HIT: %s", container_url)
+                        state["urls"].extend(cached)
+                        continue
+
+                    LOG.info("Cache MISS: %s", container_url)
+                    state["remaining"] += 1
+
+                    entry = containers_to_decrypt.setdefault(
+                        container_url,
+                        {
+                            "package_names": [],
+                            "release_keys": [],
+                        },
+                    )
+
+                    entry["package_names"].append(release.package_name)
+                    entry["release_keys"].append(release.key)
+
+            # Submit fully cached releases without starting Firefox.
+            for state in states.values():
+                if state["remaining"] != 0:
+                    continue
+
+                try:
+                    submit_resolved_release(
+                        state["release"],
+                        state["urls"],
+                        args,
+                        history_path,
+                        history,
+                    )
+                except Exception:
+                    failures += 1
+                    LOG.exception(
+                        "Failed submitting %s",
+                        state["release"].title,
+                    )
+
+            if not containers_to_decrypt:
+                LOG.info("No containers need decryption")
+                return failures
+
+            def iter_containers_to_decrypt():
+                for container_url, entry in containers_to_decrypt.items():
+                    yield {
+                        "name": entry["package_names"][0],
+                        "filecrypt_url": container_url,
+                    }
+
+            # The generator starts Camoufox once (decrypt_packages) and reuses its page.
+            for result in decrypt_packages(iter_containers_to_decrypt(), args):
+                container_url = result["filecrypt_url"]
+                entry = containers_to_decrypt[container_url]
+
+                # # Process result and update containers_to_decrypt.
+                # release_key = result["release_key"]
+                # state = states[release_key]
+                # container_url = result["filecrypt_url"]
+
+                error = result.get("decryption_error")
+                urls = result.get("decrypted_urls", [])
+
+                # if error or not urls:
+                #     state["failed"] = True
+                #     LOG.error("Failed container %s: %s", container_url, error or "No URLs")
+                # else:
+                #     # Persist immediately, before processing the next container.
+                #     try:
+                #         cache_decrypted_urls(db, container_url, urls)
+                #         state["urls"].extend(urls)
+                #     except Exception:
+                #         state["failed"] = True
+                #         LOG.exception("Could not cache %s", container_url)
+
+                if not error and urls:
+                    try:
+                        cache_decrypted_urls(db, container_url, urls)
+                    except Exception as exc:
+                        LOG.exception("Cache write failed: %s", container_url)
+                        error = f"Cache write failed: {exc}"
+                else:
+                    error = error or "No decrypted URLs"
+                    # TODO also write cache? -> dont retry broken URLs
+
+                for release_key in entry["release_keys"]:
+                    state = states[release_key]
+
+                    if error:
+                        state["failed"] = True
+                    else:
+                        state["urls"].extend(urls)
+
+                    state["remaining"] -= 1
+
+                    if state["remaining"] != 0:
+                        continue
+
+                    if state["failed"]:
+                        failures += 1
+                        LOG.warning("Skipping incomplete release %s", state["release"].title)
+                        continue
+
+                    try:
+                        submit_resolved_release(
+                            state["release"],
+                            state["urls"],
+                            args,
+                            history_path,
+                            history,
+                        )
+                    except Exception:
+                        failures += 1
+                        LOG.exception("Failed submitting %s", state["release"].title)
+
+        return failures
+
+... because on repeated runs, broken URLs are retried over and over again. example:
+
+    run 1:
+    2026-11-17 20:24:31,240 INFO Processing package 1: Wrong.Turn.2003.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2314852)
+    2026-11-17 20:24:37,783 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:24:37,783 WARNING Skipping incomplete release Wrong.Turn.2003.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+    2026-11-17 20:24:37,783 INFO Processing package 2: I.Spit.on.Your.Grave.2.2013.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2317129)
+    2026-11-17 20:24:39,038 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:24:39,038 WARNING Skipping incomplete release I.Spit.on.Your.Grave.2.2013.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+    2026-11-17 20:24:39,038 INFO Processing package 3: I.Spit.on.Your.Grave.4.Deja.Vu.2019.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2317131)
+    2026-11-17 20:24:40,392 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:24:40,392 WARNING Skipping incomplete release I.Spit.on.Your.Grave.4.Deja.Vu.2019.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+
+    run 2:
+    2026-11-17 20:26:03,157 INFO Processing package 1: Wrong.Turn.2003.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2314852)
+    2026-11-17 20:26:09,666 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:26:09,666 WARNING Skipping incomplete release Wrong.Turn.2003.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+    2026-11-17 20:26:09,666 INFO Processing package 2: I.Spit.on.Your.Grave.2.2013.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2317129)
+    2026-11-17 20:26:10,868 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:26:10,868 WARNING Skipping incomplete release I.Spit.on.Your.Grave.2.2013.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+    2026-11-17 20:26:10,868 INFO Processing package 3: I.Spit.on.Your.Grave.4.Deja.Vu.2019.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR (t2317131)
+    2026-11-17 20:26:12,098 INFO Found 0 direct URLs, 0 DLC containers
+    2026-11-17 20:26:12,098 WARNING Skipping incomplete release I.Spit.on.Your.Grave.4.Deja.Vu.2019.UNRATED.German.EAC3.DL.1080p.BluRay.x265-VECTOR
+
+note: the database changes have to be committed after every INSERT statement, to avoid data loss
+
+## Response:
+
+11/17/2026, 8:30:55 PM
+
+You can solve this with **negative caching**: store failed Filecrypt decryption results in the existing `filecrypt_cache` table, so subsequent runs skip those URLs.
+
+I recommend distinguishing three cache states:
+
+| Cache state | Database value | Behavior |
+|----|----|----|
+| Cache miss | No row | Decrypt URL |
+| Successful decryption | Nonempty JSON array | Reuse decrypted URLs |
+| Failed decryption | Empty JSON array `[]` | Skip URL, mark release incomplete |
+
+This requires only a few changes to your existing code.
+
+Importantly, **every cache INSERT or UPDATE will be committed immediately**, as requested.
+
+## 1. Modify `cache_decrypted_urls()`
+
+Your existing function explicitly refuses to cache empty URL lists:
+
+Remove that check.
+
+Replace the function with:
+
+The `with db:` context manager commits the transaction immediately when the block exits successfully.
+
+Your existing `get_cached_urls()` function already supports this representation:
+
+It returns:
+
+- `None` for a cache miss.
+- `[]` for a cached failure.
+- `["https://...", ...]` for a cached success.
+
+## 2. Handle cached failures in `process_releases()`
+
+Find this block:
+
+Replace it with:
+
+This prevents previously failed URLs from being added to `containers_to_decrypt`.
+
+## 3. Cache failed decryption results
+
+Find this section:
+
+Replace it with:
+
+Now even when `decrypt_packages()` returns zero URLs, the failure is persisted before processing the next container.
+
+## 4. Fix submission of fully cached releases
+
+There is one more important issue.
+
+Your current code submits every release with `remaining == 0`, even when it has a cached failure.
+
+Find:
+
+Replace it with:
+
+This avoids attempting to submit incomplete releases when all their containers have already been checked.
+
+## 5. Result on subsequent runs
+
+After these changes, your logs should look approximately like this:
+
+**First run:**
+
+**Second run:**
+
+No browser startup is needed when all container URLs are cached.
+
+## 6. Optional: retry failed URLs manually
+
+Sometimes a Filecrypt container is temporarily inaccessible rather than permanently broken.
+
+With the proposed implementation, cached failures persist indefinitely until explicitly removed.
+
+You can inspect them:
+
+Count them:
+
+Or remove all cached failures to force a retry:
+
+Using the SQLite command-line tool:
+
+The command-line tool commits the deletion when the statement completes.
+
+------------------------------------------------------------------------
+
+## One consideration: transient versus permanent failures
+
+The solution above deliberately caches **all** failures, including network timeouts, browser challenges, and temporary Filecrypt outages.
+
+That meets your goal of avoiding repeated attempts, but it also means potentially recoverable failures won't be retried automatically.
+
+A more robust long-term design would store an explicit `status` (`success`, `empty`, `error`) and `retry_after` timestamp. For example, empty containers could be cached indefinitely, while network errors could be retried after 24 hours.
+
+For your current implementation, though, **caching `[]` is the smallest change**, works with your existing SQLite schema, and preserves immediate commits after every cache write.
 
 ------------------------------------------------------------------------
 
