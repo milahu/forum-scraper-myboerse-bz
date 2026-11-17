@@ -41,6 +41,10 @@ from rapidfuzz import fuzz, process
 sys.path.insert(0, os.path.dirname(__file__) + "/src/filecrypt-scraper-camoufox/src")
 from filecrypt_scraper import decrypt_packages, unique
 
+beautifulsoup_html_parser = "html.parser"
+import lxml
+beautifulsoup_html_parser = "lxml"
+
 LOG = logging.getLogger("myboerse_release_importer")
 FILECRYPT_HOSTS = {"filecrypt.cc", "www.filecrypt.cc"}
 
@@ -159,7 +163,7 @@ def parse_html_file(path: Path) -> Release | None:
     try: html = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         LOG.exception("Cannot read %s", path); return None
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, beautifulsoup_html_parser)
     thread_id = extract_thread_id(path, soup)
     if thread_id is None:
         LOG.warning("No thread ID found in %s", path)
@@ -190,6 +194,91 @@ def parse_html_file(path: Path) -> Release | None:
     )
 
 
+HTML_PARSER_VERSION = 1
+
+
+def get_cached_release(
+        db: sqlite3.Connection,
+        path: Path,
+        stat: os.stat_result,
+    ) -> tuple[bool, Release | None]:
+    """
+    Return (cache_hit, release).
+
+    (False, None): cache miss
+    (True, None): cached negative result
+    (True, Release): cached release
+    """
+    row = db.execute(
+        """
+        SELECT release_json
+        FROM html_parse_cache
+        WHERE source_file = ?
+          AND file_size = ?
+          AND file_mtime_ns = ?
+          AND parser_version = ?
+        """,
+        (
+            str(path),
+            stat.st_size,
+            stat.st_mtime_ns,
+            HTML_PARSER_VERSION,
+        ),
+    ).fetchone()
+
+    if row is None:
+        return False, None
+
+    if row[0] is None:
+        return True, None
+
+    try:
+        data = json.loads(row[0])
+        return True, Release(**data)
+    except (ValueError, TypeError):
+        LOG.warning("Invalid HTML cache entry: %s", path)
+        return False, None
+
+
+def cache_parsed_release(
+        db: sqlite3.Connection,
+        path: Path,
+        stat: os.stat_result,
+        release: Release | None,
+    ) -> None:
+    db.execute(
+        """
+        INSERT INTO html_parse_cache (
+            source_file,
+            file_size,
+            file_mtime_ns,
+            parser_version,
+            release_json,
+            cached_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_file) DO UPDATE SET
+            file_size = excluded.file_size,
+            file_mtime_ns = excluded.file_mtime_ns,
+            parser_version = excluded.parser_version,
+            release_json = excluded.release_json,
+            cached_at = excluded.cached_at
+        """,
+        (
+            str(path),
+            stat.st_size,
+            stat.st_mtime_ns,
+            HTML_PARSER_VERSION,
+            (
+                json.dumps(asdict(release), ensure_ascii=False)
+                if release is not None
+                else None
+            ),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
 def parse_archive(args) -> list[Release]:
     root = Path(args.archive).expanduser()
     releases = []
@@ -197,43 +286,95 @@ def parse_archive(args) -> list[Release]:
     paths = sorted(root.rglob("*.html"))
 
     debug_stop_after_n_releases = None
-    # $ ls archive/myboerse/ | wc -l
-    # 3917
-    # debug_stop_after_n_releases = 10
     # debug_stop_after_n_releases = 100
-    # debug_stop_after_n_releases = 1_000
 
     if debug_stop_after_n_releases:
         paths = paths[:debug_stop_after_n_releases]
 
-    ignore_paths = (
-        # FIXME requests.post throws ConnectionError on too many links
-        # 651 links
-        # Akte.X.S01-S11.COMPLETE.GERMAN.AC3.720p.BluRay.x265-w00t
-        Path("archive/myboerse/1267794.html"),
-    )
     ignore_paths = None
 
     if ignore_paths:
-        def filter_path(path):
-            if path in ignore_paths: return False
-            return True
-        paths = list(filter(filter_path, paths))
+        paths = [
+            path for path in paths
+            if path not in ignore_paths
+        ]
 
-    # TODO cache results from parse_html_file
     print(f"parsing HTML files: N={len(paths)}")
-    t1 = time.time()
+    t1 = time.perf_counter()
 
-    for path in paths:
-        release = parse_html_file(path)
-        if not release:
-            continue
-        releases.append(release)
+    hits = 0
+    misses = 0
+    negative_hits = 0
 
-    t2 = time.time()
-    print(f"parsing HTML files done: dt={(t2 - t1):.2f}")
+    cache_path = Path(args.cache_db).expanduser()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(cache_path) as db:
+        init_cache(db)
+
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                LOG.exception("Cannot stat %s", path)
+                continue
+
+            hit, release = get_cached_release(
+                db,
+                path,
+                stat,
+            )
+
+            if hit:
+                hits += 1
+
+                if release is None:
+                    negative_hits += 1
+
+            else:
+                misses += 1
+
+                release = parse_html_file(path)
+
+                # Avoid caching results if the file changed
+                # while it was being parsed.
+                try:
+                    stat_after = path.stat()
+                except OSError:
+                    LOG.exception("Cannot stat %s after parsing", path)
+                    stat_after = None
+
+                if (
+                    stat_after is not None
+                    and stat_after.st_size == stat.st_size
+                    and stat_after.st_mtime_ns == stat.st_mtime_ns
+                ):
+                    cache_parsed_release(
+                        db,
+                        path,
+                        stat,
+                        release,
+                    )
+
+            if release is not None:
+                releases.append(release)
+
+        # Commit all cache writes in one transaction.
+        db.commit()
+
+    dt = time.perf_counter() - t1
+
+    print(
+        f"parsing HTML files done: "
+        f"dt={dt:.2f}s "
+        f"hits={hits} "
+        f"misses={misses} "
+        f"negative_hits={negative_hits} "
+        f"releases={len(releases)}"
+    )
 
     return releases
+
 
 def load_history(path: Path) -> dict[str, dict[str, Any]]:
     history = {}
@@ -554,6 +695,16 @@ def init_cache(db: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS filecrypt_cache (
             url TEXT PRIMARY KEY,
             decrypted_urls TEXT NOT NULL,
+            cached_at TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS html_parse_cache (
+            source_file TEXT PRIMARY KEY,
+            file_size INTEGER NOT NULL,
+            file_mtime_ns INTEGER NOT NULL,
+            parser_version INTEGER NOT NULL,
+            release_json TEXT,
             cached_at TEXT NOT NULL
         )
     """)
