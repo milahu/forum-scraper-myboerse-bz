@@ -2,9 +2,9 @@
 
 **User:** Anonymous  
 **Created:** 2026/11/11 21:10:32  
-**Updated:** 2026/11/11 22:42:12  
-**Exported:** 2026/11/12 0:29:49  
-**Link:** [<https://chatgpt.com/c/6af4cbb8-0a18-83ed-b56a-9bd585042d3e>](https://chatgpt.com/c/6af4cbb8-0a18-83ed-b56a-9bd585042d3e)
+**Updated:** 2026/11/12 21:03:21  
+**Exported:** 2026/11/17 17:39:49  
+**Link:** [<https://chatgpt.com/c/6af4cbb8-0a18-83ed-b56a-9bd585042d3e?src=history_search>](https://chatgpt.com/c/6af4cbb8-0a18-83ed-b56a-9bd585042d3e?src=history_search)
 
 ## Prompt:
 
@@ -975,6 +975,332 @@ This condition is reversed. It should be:
 Otherwise `--limit 10` won't restrict a list of 100 pending releases.
 
 **My recommendation:** Start with a fuzzy threshold of `90`, require matching years whenever both are known, and inspect the dry-run results. This gives you a conservative movie whitelist that integrates directly into your existing importer without touching the Filecrypt or pyLoad logic.
+
+## Prompt:
+
+11/12/2026, 9:01:01 PM
+
+ok, now i want to expand the "wanted-movies" feature.  
+the "wanted-movies" CLI argument should take multiple values.  
+and there should be the opposite CLI argument "unwanted-movies", which also takes multiple values.  
+the multiple values are multiple text file paths, whose contents are joined (and deduplicated) into two large lists, a whitelist of "wanted-movies" and a blacklist of "unwanted-movies" (movies that already exist in my movie catalog...)
+
+## Response:
+
+11/12/2026, 9:01:02 PM
+
+I'd extend your existing implementation to support **multiple whitelist files and multiple blacklist files**, with the blacklist taking precedence over the whitelist.
+
+The important detail is that both lists should use the same GuessIt parsing, normalization, year checking, and fuzzy matching logic.
+
+## 1. Desired CLI behavior
+
+For example:
+
+The filtering rules would be:
+
+| Wanted list | Unwanted list | Behavior |
+|----|----|----|
+| Not provided | Not provided | Keep all releases |
+| Provided | Not provided | Only keep wanted movies |
+| Not provided | Provided | Keep everything except unwanted movies |
+| Provided | Provided | Keep wanted movies, excluding unwanted movies |
+| Movie appears in both | Movie appears in both | Blacklist wins |
+
+Duplicates across files should be removed based on **normalized movie title + year**, not the original release string.
+
+## 2. Update the CLI arguments
+
+Replace the existing `--wanted-movies` argument with:
+
+Using `nargs="+"` allows multiple paths after one flag.
+
+Using `action="extend"` additionally allows repeated flags:
+
+All paths are collected into their respective lists.
+
+## 3. Update `load_wanted_movies()` to accept multiple files
+
+You can keep your existing `WantedMovie` dataclass and `normalize_movie_title()` function unchanged.
+
+Replace `load_wanted_movies()` with:
+
+<CodeBlock language="python" editable>
+def load_movie_lists(paths: Sequence[Path]) -> list[WantedMovie]:
+    """Load, parse and deduplicate movie entries from multiple files."""
+    movies = []
+    seen = set()
+
+    for path in paths:
+        path = Path(path).expanduser()
+
+        LOG.info("Loading movie list: %s", path)
+
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8-sig").splitlines(), 1
+        ):
+            release_name = line.strip()
+
+            if not release_name or release_name.startswith("#"):
+                continue
+
+            try:
+                parsed = guessit(
+                    release_name,
+                    options={"type": "movie"},
+                )
+
+                title = str(parsed.get("title", "")).strip()
+                year = parsed.get("year")
+
+                if not title:
+                    LOG.warning(
+                        "No movie title in %s:%d: %s",
+                        path, line_number, release_name,
+                    )
+                    continue
+
+                normalized = normalize_movie_title(title)
+                if not normalized:
+                    continue
+
+                year = int(year) if year is not None else None
+                key = (normalized, year)
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                movies.append(WantedMovie(
+                    title=title,
+                    normalized_title=normalized,
+                    year=year,
+                    original_release=release_name,
+                ))
+
+            except Exception:
+                LOG.exception(
+                    "Failed parsing movie in %s:%d: %s",
+                    path, line_number, release_name,
+                )
+
+    LOG.info(
+        "Loaded %d unique movies from %d files",
+        len(movies),
+        len(paths),
+    )
+
+    return movies
+
+</CodeBlock>
+
+This loads each file once, deduplicates across all provided files, and preserves the first occurrence of each movie.
+
+You can use the existing `WantedMovie` dataclass for both lists. Its name is slightly misleading now, so I'd optionally rename it to `MovieEntry` throughout the code, including the type annotations in `find_wanted_movie()`.
+
+## 4. Update `filter_releases()`
+
+The cleanest approach is to reuse your existing `find_wanted_movie()` function for both whitelist and blacklist matching.
+
+That function already handles:
+
+- GuessIt movie titles
+- Normalized title comparison
+- Fuzzy similarity scoring
+- Year compatibility
+- TV series exclusion
+
+Replace `filter_releases()` with:
+
+<CodeBlock language="python" editable>
+def filter_releases(
+    releases: list[Release],
+    args,
+) -> list[Release]:
+    selected = releases
+
+    # Existing resolution filter.
+    if args.resolution:
+        wanted_resolution = args.resolution.casefold()
+
+        selected = [
+            r for r in selected
+            if (
+                str(r.guessit.get("screen_size", "")).casefold()
+                == wanted_resolution
+                or wanted_resolution in r.title.casefold()
+            )
+        ]
+
+    # Load and deduplicate both movie lists.
+    wanted_movies = load_movie_lists(args.wanted_movies)
+    unwanted_movies = load_movie_lists(args.unwanted_movies)
+
+    LOG.info(
+        "Movie filters: wanted=%d, unwanted=%d",
+        len(wanted_movies),
+        len(unwanted_movies),
+    )
+
+    filtered = []
+
+    for release in selected:
+
+        # Step 1: Whitelist.
+        # If whitelist files were provided, a match is required.
+        if args.wanted_movies:
+            wanted_match = find_wanted_movie(
+                release,
+                wanted_movies,
+                threshold=args.movie_match_threshold,
+            )
+
+            if wanted_match is None:
+                continue
+
+        # Step 2: Blacklist.
+        # Blacklist always takes precedence.
+        if unwanted_movies:
+            unwanted_match = find_wanted_movie(
+                release,
+                unwanted_movies,
+                threshold=args.movie_match_threshold,
+            )
+
+            if unwanted_match is not None:
+                movie, score = unwanted_match
+
+                LOG.info(
+                    "BLACKLISTED (%.1f%%): %s -> %s (%s)",
+                    score,
+                    release.title,
+                    movie.title,
+                    movie.year,
+                )
+                continue
+
+        # Release passed both filters.
+        if args.wanted_movies:
+            movie, score = wanted_match
+
+            LOG.info(
+                "WANTED (%.1f%%): %s -> %s (%s)",
+                score,
+                release.title,
+                movie.title,
+                movie.year,
+            )
+
+        filtered.append(release)
+
+    LOG.info(
+        "Movie filtering: %d -> %d releases",
+        len(selected),
+        len(filtered),
+    )
+
+    return filtered
+
+</CodeBlock>
+
+An important distinction: **an empty whitelist file still means no releases are selected** when `--wanted-movies` was explicitly provided. This is safer than accidentally downloading everything.
+
+An empty blacklist, on the other hand, excludes nothing.
+
+## 5. Update argument validation
+
+Replace your existing wanted-file validation with:
+
+Keep the existing fuzzy threshold validation:
+
+## 6. Example: how the combined filtering works
+
+Suppose your files contain:
+
+<box border radius="lg" padding={3} gap={2}>
+  <row align="center" justify="between">
+    **wanted-1.txt**
+    <badge>Whitelist</badge>
+  </row>
+  ```text
+  Poor.Things.2023.German.1080p.x264
+  Barbie.2023.German.1080p.x264
+  Tar.2022.German.800p.x264
+  ```
+  <divider color="subtle"/>
+  <row align="center" justify="between">
+    **wanted-2.txt**
+    <badge>Whitelist</badge>
+  </row>
+  ```text
+  Barbie.2023.German.720p.x265
+  Ohne.Limit.2011.German.1080p.x264
+  ```
+  <divider color="subtle"/>
+  <row align="center" justify="between">
+    **existing-catalog.txt**
+    <badge>Blacklist</badge>
+  </row>
+  ```text
+  Barbie.2023.German.2160p.x265
+  Tar.2022.German.1080p.x264
+  ```
+</box>
+
+After parsing and deduplication:
+
+<grid columns={2} gap={3}>
+  <grid-item>
+    <box border radius="lg" padding={3} gap={2}>
+      <text color="secondary" weight="medium" size="xs">WANTED</text>
+      <title size="2xl" color="default" tabularNums>4</title>
+      <text size="sm">Unique movies</text>
+    </box>
+  </grid-item>
+  <grid-item>
+    <box border radius="lg" padding={3} gap={2}>
+      <text color="secondary" weight="medium" size="xs">UNWANTED</text>
+      <title size="2xl" color="default" tabularNums>2</title>
+      <text size="sm">Unique movies</text>
+    </box>
+  </grid-item>
+</grid>
+
+The effective whitelist is:
+
+| Movie              | Result                                  |
+|--------------------|-----------------------------------------|
+| Poor Things (2023) | <badge color="success">Download</badge> |
+| Barbie (2023)      | <badge>Excluded</badge>                 |
+| Tár (2022)         | <badge>Excluded</badge>                 |
+| Ohne Limit (2011)  | <badge color="success">Download</badge> |
+
+Resolution and encoding don't matter for this movie-name comparison.
+
+------------------------------------------------------------------------
+
+## 7. One additional improvement worth making
+
+Since your blacklist represents movies that already exist in your catalog, I recommend keeping the **year check enabled for both lists**.
+
+For example:
+
+- `The.Thing.1982` should not match `The.Thing.2011`.
+- `Dune.1984` should not match `Dune.2021`.
+- `Suspiria.1977` should not match `Suspiria.2018`.
+
+Your existing `find_wanted_movie()` handles this correctly when both entries have a parsed year.
+
+However, when one side has no year, it currently allows a match. For a catalog blacklist, that may be too permissive.
+
+You could make year checking stricter for the blacklist by changing:
+
+to:
+
+That would prevent accidental exclusions, but it would also mean releases missing year metadata cannot match the blacklist. I would keep the original behavior initially and review the dry-run results before changing it.
+
+**With these changes, your importer supports multiple wanted and unwanted movie files, cross-file deduplication, fuzzy matching, and blacklist precedence, while leaving the existing Filecrypt and pyLoad processing untouched.**
 
 ------------------------------------------------------------------------
 
