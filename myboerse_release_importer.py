@@ -190,22 +190,21 @@ def parse_html_file(path: Path) -> Release | None:
     )
 
 
-def parse_archive(root: Path) -> list[Release]:
+def parse_archive(args) -> list[Release]:
+    root = Path(args.archive).expanduser()
     releases = []
 
-    debug_stop_after_n_releases = None
-    # debug_stop_after_n_releases = 10
-    n = 0
-
     paths = sorted(root.rglob("*.html"))
-    # paths = [Path("archive/myboerse/1636873.html")] # debug: "bitte löschen"
-    # paths = [Path("archive/myboerse/2868879.html")] # debug: "Haunted.Hotel.S02.GERMAN.AAC.720p.WEB.x265-w00t"
 
-    # paths = paths[:100] # debug: use only the first 100 HTML files
+    debug_stop_after_n_releases = None
+    # $ ls archive/myboerse/ | wc -l
+    # 3917
+    # debug_stop_after_n_releases = 10
+    # debug_stop_after_n_releases = 100
+    # debug_stop_after_n_releases = 1_000
 
-    # TODO cache results from parse_html_file
-    print(f"parsing HTML files: N={len(paths)}")
-    t1 = time.time()
+    if debug_stop_after_n_releases:
+        paths = paths[:debug_stop_after_n_releases]
 
     ignore_paths = (
         # FIXME requests.post throws ConnectionError on too many links
@@ -213,16 +212,23 @@ def parse_archive(root: Path) -> list[Release]:
         # Akte.X.S01-S11.COMPLETE.GERMAN.AC3.720p.BluRay.x265-w00t
         Path("archive/myboerse/1267794.html"),
     )
+    ignore_paths = None
+
+    if ignore_paths:
+        def filter_path(path):
+            if path in ignore_paths: return False
+            return True
+        paths = list(filter(filter_path, paths))
+
+    # TODO cache results from parse_html_file
+    print(f"parsing HTML files: N={len(paths)}")
+    t1 = time.time()
 
     for path in paths:
-        if path in ignore_paths:
-            continue
         release = parse_html_file(path)
-        if release: releases.append(release)
-        if debug_stop_after_n_releases and release:
-            n += 1
-            if n > debug_stop_after_n_releases:
-                break
+        if not release:
+            continue
+        releases.append(release)
 
     t2 = time.time()
     print(f"parsing HTML files done: dt={(t2 - t1):.2f}")
@@ -251,7 +257,7 @@ def append_history(path: Path, release: Release, response: str) -> None:
         f.flush()
 
 def submit_links_to_pyload(links: Sequence[str], package: str, *, base_url: str = "http://localhost:9666",
-                           passwords: str | None = None, timeout: float = 15) -> str:
+                           passwords: str | None = None, timeout: float = 60) -> str:
     clean_links = [x.strip() for x in links if x and x.strip()]
     if not clean_links: raise ValueError("links must contain at least one URL")
     data = {"urls": "\n".join(clean_links), "package": package.strip()}
@@ -294,62 +300,78 @@ def normalize_movie_title(title: str) -> str:
     return " ".join(title.split())
 
 
-def load_wanted_movies(path: Path) -> list[WantedMovie]:
-    """Parse the wanted release names into movie titles."""
+def load_movie_lists(paths: Sequence[Path]) -> list[WantedMovie]:
+    """Load, parse and deduplicate movie entries from multiple files."""
     movies = []
     seen = set()
 
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8-sig").splitlines(), 1
-    ):
-        release_name = line.strip()
+    for path in paths:
+        path = Path(path).expanduser()
 
-        if not release_name or release_name.startswith("#"):
-            continue
+        LOG.info("Loading movie list: %s", path)
 
-        try:
-            # Force movie parsing for the wanted list.
-            parsed = guessit(
-                release_name,
-                options={"type": "movie"},
-            )
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8-sig").splitlines(), 1
+        ):
+            release_name = line.strip()
 
-            title = str(parsed.get("title", "")).strip()
-            year = parsed.get("year")
+            if not release_name or release_name.startswith("#"):
+                continue
 
-            if not title:
-                LOG.warning(
-                    "No movie title on line %d: %s",
-                    line_number, release_name,
+            try:
+                parsed = guessit(
+                    release_name,
+                    options={"type": "movie"},
                 )
-                continue
 
-            normalized = normalize_movie_title(title)
-            if not normalized:
-                continue
+                title = str(parsed.get("title", "")).strip()
+                year = parsed.get("year")
 
-            year = int(year) if year is not None else None
-            key = (normalized, year)
+                if not title:
+                    LOG.warning(
+                        "No movie title in %s:%d: %s",
+                        path, line_number, release_name,
+                    )
+                    continue
 
-            if key in seen:
-                continue
+                normalized = normalize_movie_title(title)
+                if not normalized:
+                    continue
 
-            seen.add(key)
+                # year = int(year) if year is not None else None
+                if isinstance(year, list):
+                    # the parser found multiple years
+                    # use the first year
+                    year = year[0]
+                if isinstance(year, str):
+                    year = int(year)
 
-            movies.append(WantedMovie(
-                title=title,
-                normalized_title=normalized,
-                year=year,
-                original_release=release_name,
-            ))
+                key = (normalized, year)
 
-        except Exception:
-            LOG.exception(
-                "Failed parsing wanted movie on line %d: %s",
-                line_number, release_name,
-            )
+                if key in seen:
+                    continue
 
-    LOG.info("Loaded %d wanted movies from %s", len(movies), path)
+                seen.add(key)
+
+                movies.append(WantedMovie(
+                    title=title,
+                    normalized_title=normalized,
+                    year=year,
+                    original_release=release_name,
+                ))
+
+            except Exception:
+                LOG.exception(
+                    "Failed parsing movie in %s:%d: %s",
+                    path, line_number, release_name,
+                )
+
+    LOG.info(
+        "Loaded %d unique movies from %d files",
+        len(movies),
+        len(paths),
+    )
+
     return movies
 
 
@@ -414,39 +436,116 @@ def find_wanted_movie(
     return candidates[index], score
 
 
-def filter_releases(releases: list[Release], args) -> list[Release]:
-    """Customization point: add user-specific filters here."""
+def filter_releases(
+        releases: list[Release],
+        args,
+    ) -> list[Release]:
     selected = releases
-    if args.resolution:
-        wanted = args.resolution.casefold()
-        selected = [r for r in selected if str(r.guessit.get("screen_size", "")).casefold() == wanted or wanted in r.title.casefold()]
-    if args.wanted_movies:
-        wanted_movies = load_wanted_movies(
-            Path(args.wanted_movies).expanduser()
-        )
-        if not wanted_movies:
-            LOG.warning("Wanted movie list is empty")
-            return []
-        matched = []
+
+    if not selected:
+        print(f"filter_releases: empty input")
+        return selected
+
+    if 0:
+        # debug
         for release in selected:
-            result = find_wanted_movie(
+            print(f"filter_releases: release={release}")
+            sys.exit()
+
+    # filter by thread author
+    # if args.author_id:
+
+    if args.release_group:
+        wanted_release_group = args.release_group.casefold()
+        selected = [
+            release for release in selected
+            if release.guessit.get("release_group", "").casefold() == wanted_release_group
+        ]
+        print(f"filter_releases: {len(releases)} releases remain after filtering by release group")
+        if not selected:
+            return selected
+
+    if args.resolution:
+        # filter by video resolution
+        wanted_resolution = args.resolution.casefold()
+        selected = [
+            release for release in selected
+            if (
+                str(release.guessit.get("screen_size", "")).casefold() == wanted_resolution
+                or wanted_resolution in release.title.casefold()
+            )
+        ]
+        print(f"filter_releases: {len(releases)} releases remain after filtering by resolution")
+        if not selected:
+            return selected
+
+    # Load and deduplicate both movie lists.
+    wanted_movies = load_movie_lists(args.wanted_movies)
+    unwanted_movies = load_movie_lists(args.unwanted_movies)
+
+    LOG.info(
+        "Movie filters: wanted=%d, unwanted=%d",
+        len(wanted_movies),
+        len(unwanted_movies),
+    )
+
+    filtered = []
+
+    for release in selected:
+
+        # Step 1: Whitelist.
+        # If whitelist files were provided, a match is required.
+        if args.wanted_movies:
+            wanted_match = find_wanted_movie(
                 release,
                 wanted_movies,
                 threshold=args.movie_match_threshold,
             )
-            if result is None:
+
+            if wanted_match is None:
                 continue
-            movie, score = result
+
+        # Step 2: Blacklist.
+        # Blacklist always takes precedence.
+        if unwanted_movies:
+            unwanted_match = find_wanted_movie(
+                release,
+                unwanted_movies,
+                threshold=args.movie_match_threshold,
+            )
+
+            if unwanted_match is not None:
+                movie, score = unwanted_match
+
+                LOG.info(
+                    "BLACKLISTED (%.1f%%): %s -> %s (%s)",
+                    score,
+                    release.title,
+                    movie.title,
+                    movie.year,
+                )
+                continue
+
+        # Release passed both filters.
+        if args.wanted_movies:
+            movie, score = wanted_match
+
             LOG.info(
-                "Movie match (%.1f%%): %s -> %s (%s)",
+                "WANTED (%.1f%%): %s -> %s (%s)",
                 score,
                 release.title,
                 movie.title,
                 movie.year,
             )
-            matched.append(release)
-        selected = matched
-        LOG.info("Wanted movie filter: %d matching releases", len(selected))
+
+        filtered.append(release)
+
+    print(f"filter_releases: {len(filtered)} releases remain after filtering by wanted and unwanted movies")
+    if not filtered:
+        return filtered
+    LOG.info(f"Movie filtering: {len(selected)} -> {len(filtered)} releases")
+    selected = filtered
+
     return selected
 
 
@@ -569,6 +668,8 @@ def process_releases(
         for release in releases:
             if release.key in history or release.key in states:
                 continue
+
+            # print(f"release {release}"); sys.exit() # debug
 
             state = {
                 "release": release,
@@ -704,9 +805,10 @@ def main() -> int:
     p.add_argument("--history", default="pyload_added.jsonl", help="JSONL history of successful submissions")
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
+    p.add_argument("--release-group", help="Filter by release group name")
     p.add_argument("--dry-run", action="store_true", help="List candidates without submitting")
     p.add_argument("--passwords", help="Optional archive password string passed to pyLoad")
-    p.add_argument("--timeout", type=float, default=15.0)
+    p.add_argument("--timeout", type=float, default=60)
     p.add_argument("--json-out", help="Write parsed release inventory as JSON")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--limit", type=int, default=0, help="Limit the number of releases to process after filtering")
@@ -726,7 +828,21 @@ def main() -> int:
     p.add_argument(
         "--wanted-movies",
         type=Path,
-        help="Text file containing wanted movie release names",
+        nargs="+",
+        action="extend",
+        default=[],
+        metavar="FILE",
+        help="One or more text files containing wanted movie release names",
+    )
+
+    p.add_argument(
+        "--unwanted-movies",
+        type=Path,
+        nargs="+",
+        action="extend",
+        default=[],
+        metavar="FILE",
+        help="One or more text files containing movies to exclude",
     )
     p.add_argument(
         "--movie-match-threshold",
@@ -740,13 +856,18 @@ def main() -> int:
         print(f"args.{key}={val!r}")
     if not 0 <= args.movie_match_threshold <= 100:
         p.error("--movie-match-threshold must be between 0 and 100")
-    if args.wanted_movies and not args.wanted_movies.expanduser().is_file():
-        p.error(f"Wanted movie file does not exist: {args.wanted_movies}")
+    for label, paths in (
+        ("--wanted-movies", args.wanted_movies),
+        ("--unwanted-movies", args.unwanted_movies),
+    ):
+        for path in paths:
+            if not path.expanduser().is_file():
+                p.error(f"{label}: file does not exist: {path}")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     archive = Path(args.archive).expanduser()
     if not archive.is_dir(): p.error(f"archive directory does not exist: {archive}")
     # Stage 1: parse the entire archive.
-    releases = parse_archive(archive)
+    releases = parse_archive(args)
     LOG.info("Parsed %d releases.", len(releases))
     if args.json_out:
         out = Path(args.json_out).expanduser(); out.parent.mkdir(parents=True, exist_ok=True)

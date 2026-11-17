@@ -53,7 +53,7 @@ async def login_if_needed(page, config: dict) -> None:
         raise RuntimeError("Config must contain non-empty 'username' and 'password'.")
 
     await page.goto("https://myboerse.bz/login/", wait_until="domcontentloaded")
-    await page.locator("input[name='login']").first.wait_for(state="visible", timeout=20000)
+    await page.locator("input[name='login']").first.wait_for(state="visible", timeout=20_000)
     await page.locator("input[name='login']").first.fill(username)
     await page.locator("input[name='password']").first.fill(password)
 
@@ -66,7 +66,8 @@ async def login_if_needed(page, config: dict) -> None:
         await page.locator("input[name='password']").first.press("Enter")
 
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        # await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        await page.wait_for_load_state("domcontentloaded", timeout=60_000) # 60 seconds
     except PlaywrightTimeoutError:
         pass
     await page.wait_for_timeout(1200)
@@ -232,7 +233,8 @@ async def async_main(args) -> int:
             user_agent=config.get("user_agent") or None,
         )
         page = await context.new_page()
-        page.set_default_timeout(15000)
+        # page.set_default_timeout(15_000) # 15 seconds
+        page.set_default_timeout(60_000) # 60 seconds
         try:
             await login_if_needed(page, config)
             path = urlparse(args.start_url).path
