@@ -731,9 +731,13 @@ def cache_decrypted_urls(
         url: str,
         urls: list[str],
     ) -> None:
-    if not urls:
-        raise ValueError("Refusing to cache empty URL list")
+    """
+    Cache successful and failed decryption results.
 
+    urls == [] means decryption failed or found no URLs.
+    """
+
+    # NOTE The "with db:" context manager commits the transaction immediately when the block exits successfully.
     with db:
         db.execute(
             """
@@ -833,9 +837,15 @@ def process_releases(
             for container_url in unique(release.filecrypt_links):
                 cached = get_cached_urls(db, container_url)
 
+                # dont add previously failed URLs to containers_to_decrypt.
                 if cached is not None:
-                    LOG.info("Cache HIT: %s", container_url)
-                    state["urls"].extend(cached)
+                    if not cached:
+                        LOG.info("Cache HIT (failed): %s", container_url)
+                        state["failed"] = True
+                    else:
+                        LOG.info("Cache HIT: %s", container_url)
+                        state["urls"].extend(cached)
+
                     continue
 
                 LOG.info("Cache MISS: %s", container_url)
@@ -855,6 +865,16 @@ def process_releases(
         # Submit fully cached releases without starting Firefox.
         for state in states.values():
             if state["remaining"] != 0:
+                continue
+
+            if state["failed"]:
+                failures += 1
+                LOG.warning(
+                    "Skipping incomplete release (cached failure): %s",
+                    state["release"].title,
+                )
+                # avoid attempting to submit incomplete releases
+                # when all their containers have already been checked.
                 continue
 
             try:
@@ -908,14 +928,30 @@ def process_releases(
             #         state["failed"] = True
             #         LOG.exception("Could not cache %s", container_url)
 
-            if not error and urls:
-                try:
-                    cache_decrypted_urls(db, container_url, urls)
-                except Exception as exc:
-                    LOG.exception("Cache write failed: %s", container_url)
-                    error = f"Cache write failed: {exc}"
-            else:
+            if error or not urls:
                 error = error or "No decrypted URLs"
+                urls = []
+
+                LOG.warning(
+                    "Decryption failed for %s: %s",
+                    container_url,
+                    error,
+                )
+
+            try:
+                # Cache both successes and failures.
+                # An empty list represents a failed decryption.
+                # The transaction is committed immediately.
+                # FIXME filecrypt.cc returns a fake HTTP 404 status on too many requests
+                # when it should return a HTTP 429 status
+                # so we should rate-limit our decrypter
+                # TODO find parameters for rate-limiting
+                # TODO add random delays between decryptions
+                cache_decrypted_urls(db, container_url, urls)
+
+            except Exception as exc:
+                LOG.exception("Cache write failed: %s", container_url)
+                error = f"Cache write failed: {exc}"
 
             for release_key in entry["release_keys"]:
                 state = states[release_key]
