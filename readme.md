@@ -46,3 +46,12 @@ Files are named `<thread-id>.html`. Existing files are never refreshed or overwr
 - Non-member start URLs intentionally raise `NotImplementedError` until a handler is implemented.
 - Forum markup and login behavior can change. If it reports no thread results, inspect the visible browser and update the XenForo selectors in `extract_thread_links()` / `find_next_page()`.
 - Use only for content you are authorized to access, and keep request rates modest.
+
+## Limitations
+
+### Rate-limiting
+
+On too many requests, filecrypt.cc starts returning a fake HTTP 404 (Not Found) response status code,
+when it actually should return an HTTP 429 (Too Many Requests) response status code.
+This happens after about 70 to 100 consecutive requests.
+The block lasts for maximum 24 hours, probably less.
