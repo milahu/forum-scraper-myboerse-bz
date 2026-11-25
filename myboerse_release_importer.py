@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import random
 import argparse, hashlib, json, logging, re, sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -964,6 +965,7 @@ def main() -> int:
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--limit", type=int, default=0, help="Limit the number of releases to process after filtering")
     p.add_argument("--headful", action="store_true", help="Show Firefox and allow manual challenge completion")
+    p.add_argument("--shuffle", action="store_true", help="Process releases in random order")
     p.add_argument(
         "--cache-db",
         type=Path,
@@ -1019,6 +1021,9 @@ def main() -> int:
     if not archive.is_dir(): p.error(f"archive directory does not exist: {archive}")
     # Stage 1: parse the entire archive.
     releases = parse_archive(args)
+    if args.shuffle:
+        # process releases in random order
+        random.shuffle(releases)
     LOG.info("Parsed %d releases.", len(releases))
     if args.json_out:
         out = Path(args.json_out).expanduser(); out.parent.mkdir(parents=True, exist_ok=True)
