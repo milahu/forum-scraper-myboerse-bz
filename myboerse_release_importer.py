@@ -60,6 +60,7 @@ class Release:
     filecrypt_links: list[str]
     guessit: dict[str, Any] = field(default_factory=dict)
     filecrypt_hosters: dict[str, list[str]] = field(default_factory=dict)
+    subforum: str | None = None
     @property
     def key(self) -> str:
         return f"t{self.thread_id}"
@@ -173,6 +174,20 @@ def extract_filecrypt_links(soup: BeautifulSoup) -> tuple[list[str], dict[str, l
         if hosters
     }
 
+
+def extract_subforum(soup: BeautifulSoup) -> str | None:
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and data.get("@type") == "DiscussionForumPosting":
+            section = data.get("articleSection")
+            if isinstance(section, str):
+                return section
+    return None
+
+
 def parse_html_file(path: Path) -> Release | None:
     # print(f"parse_html_file: path={path!r}")
     try: html = path.read_text(encoding="utf-8", errors="replace")
@@ -207,10 +222,11 @@ def parse_html_file(path: Path) -> Release | None:
         filecrypt_links=links,
         guessit=guessit_data,
         filecrypt_hosters=hosters,
+        subforum=extract_subforum(soup),
     )
 
 
-HTML_PARSER_VERSION = 3
+HTML_PARSER_VERSION = 4
 
 
 def get_cached_release(
@@ -297,6 +313,7 @@ def cache_parsed_release(
 
 def parse_archive(args) -> list[Release]:
     root = Path(args.archive).expanduser()
+    subforums = set(args.subforum)
     releases = []
 
     paths = sorted(root.rglob("*.html"))
@@ -372,7 +389,7 @@ def parse_archive(args) -> list[Release]:
                         release,
                     )
 
-            if release is not None:
+            if release is not None and (not subforums or release.subforum in subforums):
                 releases.append(release)
 
         # Commit all cache writes in one transaction.
@@ -1001,6 +1018,14 @@ def main() -> int:
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
     p.add_argument("--release-group", help="Filter by release group name")
+    p.add_argument(
+        "--subforum",
+        nargs="+",
+        action="extend",
+        default=[],
+        metavar="NAME",
+        help="Filter by one or more exact subforum names",
+    )
     p.add_argument(
         "--filehoster",
         type=normalize_filehoster,
