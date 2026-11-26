@@ -24,7 +24,7 @@ import sys
 import time
 import random
 import argparse, hashlib, json, logging, re, sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -48,6 +48,8 @@ beautifulsoup_html_parser = "lxml"
 
 LOG = logging.getLogger("myboerse_release_importer")
 FILECRYPT_HOSTS = {"filecrypt.cc", "www.filecrypt.cc"}
+RAPIDGATOR_BADGE = "https://i.imgur.com/DrqaS42.png"
+DDOWNLOAD_BADGE = "https://i.imgur.com/lQ55QX4.png"
 
 @dataclass
 class Release:
@@ -57,6 +59,7 @@ class Release:
     title_source: str
     filecrypt_links: list[str]
     guessit: dict[str, Any] = field(default_factory=dict)
+    filecrypt_hosters: dict[str, list[str]] = field(default_factory=dict)
     @property
     def key(self) -> str:
         return f"t{self.thread_id}"
@@ -152,12 +155,23 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
         if candidate: return candidate, "page-title"
     return None, None
 
-def extract_filecrypt_links(soup: BeautifulSoup) -> list[str]:
-    links = []
+def extract_filecrypt_links(soup: BeautifulSoup) -> tuple[list[str], dict[str, list[str]]]:
+    links: dict[str, set[str]] = {}
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
-        if is_filecrypt_container(href) and href not in links: links.append(href)
-    return links
+        if not is_filecrypt_container(href):
+            continue
+        hosters = links.setdefault(href, set())
+        badges = {img.get(attr) for img in a.find_all("img") for attr in ("src", "data-url")}
+        if DDOWNLOAD_BADGE in badges:
+            hosters.add("ddownload.com")
+        if RAPIDGATOR_BADGE in badges:
+            hosters.add("rapidgator.net")
+    return list(links), {
+        href: sorted(hosters)
+        for href, hosters in links.items()
+        if hosters
+    }
 
 def parse_html_file(path: Path) -> Release | None:
     # print(f"parse_html_file: path={path!r}")
@@ -175,7 +189,7 @@ def parse_html_file(path: Path) -> Release | None:
     )
     if title in bad_titles: return None
     # print(f"parse_html_file: title={title!r}, source={source!r}")
-    links = extract_filecrypt_links(soup)
+    links, hosters = extract_filecrypt_links(soup)
     if not title:
         LOG.warning("No release title found in %s", path); return None
     if not links:
@@ -192,10 +206,11 @@ def parse_html_file(path: Path) -> Release | None:
         title_source=source or "unknown",
         filecrypt_links=links,
         guessit=guessit_data,
+        filecrypt_hosters=hosters,
     )
 
 
-HTML_PARSER_VERSION = 1
+HTML_PARSER_VERSION = 3
 
 
 def get_cached_release(
@@ -584,6 +599,25 @@ def filter_releases(
     ) -> list[Release]:
     selected = releases
 
+    if args.filehoster:
+        selected = []
+        for release in releases:
+            links = [
+                url for url in release.filecrypt_links
+                if not release.filecrypt_hosters.get(url)
+                or args.filehoster in release.filecrypt_hosters[url]
+            ]
+            if links:
+                selected.append(replace(
+                    release,
+                    filecrypt_links=links,
+                    filecrypt_hosters={
+                        url: release.filecrypt_hosters[url]
+                        for url in links
+                        if url in release.filecrypt_hosters
+                    },
+                ))
+
     if not selected:
         print(f"filter_releases: empty input")
         return selected
@@ -951,6 +985,15 @@ def process_releases(
     return failures
 
 
+def normalize_filehoster(value: str) -> str:
+    host = value.strip().casefold().removeprefix("www.")
+    return {
+        "rapidgator": "rapidgator.net",
+        "ddownload": "ddownload.com",
+        "ddl.to": "ddownload.com",
+    }.get(host, host)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--archive", default="archive", help="Directory containing archived thread HTML")
@@ -958,6 +1001,11 @@ def main() -> int:
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
     p.add_argument("--release-group", help="Filter by release group name")
+    p.add_argument(
+        "--filehoster",
+        type=normalize_filehoster,
+        help="Keep Filecrypt links for this host (e.g. rapidgator.net) and links with an unknown host",
+    )
     p.add_argument("--dry-run", action="store_true", help="List candidates without submitting")
     p.add_argument("--passwords", help="Optional archive password string passed to pyLoad")
     p.add_argument("--timeout", type=float, default=60)
