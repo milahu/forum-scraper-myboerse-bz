@@ -34,7 +34,7 @@ import sqlite3
 from collections.abc import Iterable, Iterator
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from guessit import guessit
 
 import unicodedata
@@ -174,7 +174,7 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
         if candidate: return candidate, "page-title"
     return None, None
 
-def extract_download_links(soup: BeautifulSoup) -> tuple[list[str], list[str], dict[str, list[str]]]:
+def extract_download_links(soup: Tag) -> tuple[list[str], list[str], dict[str, list[str]]]:
     links: dict[str, set[str]] = {}
     direct_links: dict[str, None] = {}
     for a in soup.select("a[href]"):
@@ -225,7 +225,7 @@ def extract_subforum(soup: BeautifulSoup) -> str | None:
     return None
 
 
-def parse_html_file(path: Path) -> Release | None:
+def parse_html_file(path: Path, *, first_post_links: bool = False) -> Release | None:
     # print(f"parse_html_file: path={path!r}")
     try: html = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -241,7 +241,23 @@ def parse_html_file(path: Path) -> Release | None:
     )
     if title in bad_titles: return None
     # print(f"parse_html_file: title={title!r}, source={source!r}")
-    direct_links, links, hosters = extract_download_links(soup)
+    link_scope = soup
+    if first_post_links:
+        link_scope = next(
+            (
+                post
+                for post in soup.select('article.message--post[data-content^="post-"], table.tborder[id^="post"]')
+                if re.fullmatch(
+                    r"post-?[0-9]+",
+                    post.get("data-content" if post.name == "article" else "id", ""),
+                )
+            ),
+            None,
+        )
+        if link_scope is None:
+            LOG.debug("No first post found in %s", path)
+            return None
+    direct_links, links, hosters = extract_download_links(link_scope)
     if not title:
         LOG.warning("No release title found in %s", path); return None
     if not links and not direct_links:
@@ -265,12 +281,15 @@ def parse_html_file(path: Path) -> Release | None:
 
 
 HTML_PARSER_VERSION = 5
+# The cache has one row per file. Use a different version for first-post results.
+FIRST_POST_HTML_PARSER_VERSION = -HTML_PARSER_VERSION
 
 
 def get_cached_release(
         db: sqlite3.Connection,
         path: Path,
         stat: os.stat_result,
+        parser_version: int = HTML_PARSER_VERSION,
     ) -> tuple[bool, Release | None]:
     """
     Return (cache_hit, release).
@@ -292,7 +311,7 @@ def get_cached_release(
             str(path),
             stat.st_size,
             stat.st_mtime_ns,
-            HTML_PARSER_VERSION,
+            parser_version,
         ),
     ).fetchone()
 
@@ -315,6 +334,7 @@ def cache_parsed_release(
         path: Path,
         stat: os.stat_result,
         release: Release | None,
+        parser_version: int = HTML_PARSER_VERSION,
     ) -> None:
     db.execute(
         """
@@ -338,7 +358,7 @@ def cache_parsed_release(
             str(path),
             stat.st_size,
             stat.st_mtime_ns,
-            HTML_PARSER_VERSION,
+            parser_version,
             (
                 json.dumps(asdict(release), ensure_ascii=False)
                 if release is not None
@@ -353,6 +373,7 @@ def parse_archive(args) -> list[Release]:
     root = Path(args.archive).expanduser()
     subforums = set(args.subforum)
     releases = []
+    parser_version = FIRST_POST_HTML_PARSER_VERSION if args.first_post_links else HTML_PARSER_VERSION
 
     paths = sorted(root.rglob("*.html"))
 
@@ -394,6 +415,7 @@ def parse_archive(args) -> list[Release]:
                 db,
                 path,
                 stat,
+                parser_version,
             )
 
             if hit:
@@ -405,7 +427,7 @@ def parse_archive(args) -> list[Release]:
             else:
                 misses += 1
 
-                release = parse_html_file(path)
+                release = parse_html_file(path, first_post_links=args.first_post_links)
 
                 # Avoid caching results if the file changed
                 # while it was being parsed.
@@ -425,6 +447,7 @@ def parse_archive(args) -> list[Release]:
                         path,
                         stat,
                         release,
+                        parser_version,
                     )
 
             if release is not None and (not subforums or release.subforum in subforums):
@@ -1064,6 +1087,11 @@ def main() -> int:
     )
     p.add_argument("--history", default="pyload_added.jsonl", help="JSONL history of successful submissions")
     p.add_argument("--pyload-url", default="http://localhost:9666")
+    p.add_argument(
+        "--first-post-links",
+        action="store_true",
+        help="Extract download links only from the first post in each archived thread",
+    )
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
     p.add_argument("--release-group", help="Filter by release group name")
     p.add_argument(
