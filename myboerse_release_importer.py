@@ -1014,6 +1014,11 @@ def normalize_filehoster(value: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--archive", default="archive", help="Directory containing archived thread HTML")
+    p.add_argument(
+        "--forum",
+        metavar="DOMAIN",
+        help="Read archived thread HTML from this domain's subdirectory under --archive",
+    )
     p.add_argument("--history", default="pyload_added.jsonl", help="JSONL history of successful submissions")
     p.add_argument("--pyload-url", default="http://localhost:9666")
     p.add_argument("--resolution", help="Optional filter, e.g. 720p")
@@ -1077,6 +1082,10 @@ def main() -> int:
         help="Minimum fuzzy movie title similarity (0-100, default: 90)",
     )
     args = p.parse_args()
+    if args.forum is not None:
+        if not re.fullmatch(r"[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+", args.forum):
+            p.error("--forum must be a domain name (e.g. mygully.com)")
+        args.archive = str(Path(args.archive).expanduser() / args.forum)
     # print(f"args={args}")
     for key, val in args.__dict__.items():
         print(f"args.{key}={val!r}")
