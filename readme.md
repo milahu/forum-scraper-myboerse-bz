@@ -1,6 +1,6 @@
 # MyBoerse thread archiver
 
-Archives thread pages as HTML using Patchright. The current implementation supports member profile URLs only.
+Archives thread pages as HTML using Camoufox. The current implementation supports member profile URLs only.
 
 ## Setup
 
@@ -10,7 +10,7 @@ python -m venv .venv
 # macOS/Linux:
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-patchright install chromium
+python -m camoufox fetch
 ```
 
 Create a private JSON config, for example `config.json`:

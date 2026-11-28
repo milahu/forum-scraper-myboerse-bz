@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive MyBoerse member-created threads as HTML, using Patchright."""
+"""Archive MyBoerse member-created threads as HTML, using Camoufox."""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
-from patchright.async_api import async_playwright
-from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 BASE_HOST = "myboerse.bz"
 LOG = logging.getLogger("myboerse_scraper")
@@ -225,8 +225,7 @@ async def async_main(args) -> int:
     output = Path(args.output).expanduser()
     output.mkdir(parents=True, exist_ok=True)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=args.headless)
+    async with AsyncCamoufox(headless=args.headless) as browser:
         context = await browser.new_context(
             accept_downloads=False,
             locale="de-DE",
@@ -253,7 +252,6 @@ async def async_main(args) -> int:
             raise
         finally:
             await context.close()
-            await browser.close()
     return 0
 
 
