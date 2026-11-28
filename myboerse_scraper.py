@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive MyBoerse member-created threads as HTML, using Camoufox."""
+"""Archive MyBoerse member threads and MyGully subforums as HTML using Camoufox."""
 from __future__ import annotations
 
 import argparse
@@ -9,12 +9,16 @@ import logging
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from tempfile import NamedTemporaryFile
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit
 
 from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 BASE_HOST = "myboerse.bz"
+MYGULLY_HOST = "mygully.com"
+MYGULLY_SUBFORUM = re.compile(r"/forum/(\d+)(?:-[^/]+)?/?")
+MYGULLY_LOGOUT = "a[href*='login.php?do=logout']"
 LOG = logging.getLogger("myboerse_scraper")
 
 
@@ -24,8 +28,14 @@ def safe_name(value: str) -> str:
 
 
 def thread_id_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.hostname == MYGULLY_HOST:
+        thread_id = parse_qs(parsed.query).get("t", [""])[0]
+        if parsed.path.endswith("/showthread.php") and re.fullmatch(r"[0-9]+", thread_id):
+            return thread_id
+        return None
     # XenForo thread URLs normally end in a numeric thread ID.
-    path = urlparse(url).path.rstrip("/")
+    path = parsed.path.rstrip("/")
     m = re.search(r"\.(\d+)$", path)
     if m and "/threads/" in path:
         return m.group(1)
@@ -35,8 +45,77 @@ def thread_id_from_url(url: str) -> str | None:
 
 def validate_forum_url(url: str) -> None:
     p = urlparse(url)
-    if p.scheme not in ("https", "http") or p.hostname != BASE_HOST:
-        raise ValueError(f"Only URLs on https://{BASE_HOST}/ are supported: {url}")
+    if p.scheme not in ("https", "http") or p.hostname not in (BASE_HOST, MYGULLY_HOST):
+        raise ValueError(f"Only URLs on {BASE_HOST} and {MYGULLY_HOST} are supported: {url}")
+
+
+async def login_mygully(page, config: dict) -> None:
+    await page.goto(f"https://{MYGULLY_HOST}/", wait_until="domcontentloaded")
+    logout = page.locator(MYGULLY_LOGOUT).first
+    username = page.locator('input[name="vb_login_username"]').first
+    await username.or_(logout).first.wait_for(state="visible")
+    if await logout.count():
+        LOG.info("Already logged in to MyGully.")
+        return
+
+    if not config.get("username") or not config.get("password"):
+        raise RuntimeError("Config must contain non-empty 'username' and 'password'.")
+
+    form = page.locator("form").filter(has=username).first
+    action = urlsplit(urljoin(page.url, await form.get_attribute("action") or ""))
+    if action.scheme != "https" or action.netloc != MYGULLY_HOST or action.path != "/login.php":
+        raise RuntimeError("Unexpected MyGully login form action.")
+    await username.fill(config["username"])
+    await form.locator('input[name="vb_login_password"]').fill(config["password"])
+    await form.locator('input[type="submit"], button[type="submit"]').first.click()
+    try:
+        await logout.wait_for(state="visible")
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("Could not confirm MyGully login. Check the credentials and browser page.") from exc
+
+
+def mygully_page_number(url: str) -> int:
+    value = parse_qs(urlsplit(url).query).get("page", ["1"])[0]
+    return int(value) if re.fullmatch(r"[0-9]+", value) else 1
+
+
+async def mygully_next_page(page, current: str, start_url: str) -> str | None:
+    start = urlsplit(start_url)
+    forum = MYGULLY_SUBFORUM.fullmatch(start.path)
+    forum_id = forum.group(1)
+    next_number = mygully_page_number(current) + 1
+    hrefs = await page.locator('a[href*="forumdisplay.php"][href*="page="]').evaluate_all(
+        "(links) => links.map(link => link.href)"
+    )
+    for href in hrefs:
+        candidate = urlsplit(href)
+        if candidate.hostname != MYGULLY_HOST or candidate.scheme not in ("http", "https"):
+            continue
+        params = parse_qs(candidate.query, keep_blank_values=True)
+        if params.get("f") != [forum_id] or mygully_page_number(href) != next_number:
+            continue
+        # Keep the listing's pagination parameters and the caller's filters.
+        params.update(parse_qs(start.query, keep_blank_values=True))
+        params["f"] = [forum_id]
+        params["page"] = [str(next_number)]
+        return candidate._replace(query=urlencode(params, doseq=True), fragment="").geturl()
+    return None
+
+
+async def mygully_thread_links(page) -> list[str]:
+    titles = page.locator('a[id^="thread_title_"][href]')
+    if not await titles.count():
+        titles = page.locator('a[href*="showthread.php?"][href*="t="]')
+    hrefs = await titles.evaluate_all("(links) => links.map(link => link.href)")
+    threads = {}
+    for href in hrefs:
+        if urlsplit(href).hostname != MYGULLY_HOST:
+            continue
+        thread_id = thread_id_from_url(href)
+        params = parse_qs(urlsplit(href).query)
+        if thread_id and not {"goto", "p", "page"}.intersection(params):
+            threads.setdefault(thread_id, href)
+    return list(threads.values())
 
 
 async def login_if_needed(page, config: dict) -> None:
@@ -151,6 +230,63 @@ async def find_next_page(page) -> str | None:
     return None
 
 
+def write_thread_html(target: Path, html: str) -> None:
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            file.write(html)
+            file.close()
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+async def scrape_mygully_subforum(page, start_url: str, output: Path, delay: float) -> None:
+    current = start_url
+    downloaded = skipped = 0
+    seen_threads = set()
+    while current:
+        LOG.info("Subforum page: %s", current)
+        response = await page.goto(current, wait_until="domcontentloaded")
+        if not response or not response.ok or urlsplit(page.url).hostname != MYGULLY_HOST:
+            raise RuntimeError(f"Could not open MyGully listing {current}")
+        if mygully_page_number(page.url) != mygully_page_number(current):
+            raise RuntimeError(f"MyGully redirected to a different listing page: {page.url}")
+
+        thread_urls = await mygully_thread_links(page)
+        if not thread_urls:
+            raise RuntimeError(f"No MyGully thread links found at {page.url}")
+        next_url = await mygully_next_page(page, current, start_url)
+
+        for thread_url in thread_urls:
+            thread_id = thread_id_from_url(thread_url)
+            if thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+            target = output / f"{thread_id}.html"
+            if target.exists():
+                skipped += 1
+                continue
+            LOG.info("Downloading thread %s: %s", thread_id, thread_url)
+            response = await page.goto(thread_url, wait_until="domcontentloaded")
+            if (
+                not response
+                or not response.ok
+                or urlsplit(page.url).hostname != MYGULLY_HOST
+                or thread_id_from_url(page.url) != thread_id
+                or not await page.locator("#posts").count()
+            ):
+                raise RuntimeError(f"Could not load MyGully thread {thread_id} at {thread_url}")
+            write_thread_html(target, await page.content())
+            downloaded += 1
+            await asyncio.sleep(delay)
+
+        current = next_url
+        if current:
+            await asyncio.sleep(delay)
+    LOG.info("Finished. Downloaded %d; skipped cached %d.", downloaded, skipped)
+
+
 async def scrape_member(page, member_url: str, output: Path, delay: float) -> None:
     search_url = await member_search_url(page, member_url)
     print(f"scrape_member: search_url={search_url!r}")
@@ -195,10 +331,7 @@ async def scrape_member(page, member_url: str, output: Path, delay: float) -> No
             html = await page.content()
             if len(html) < 1000:
                 raise RuntimeError(f"Refusing to cache suspiciously short HTML for {thread_url}")
-            # Atomic write: interrupted runs won't leave a partial file that looks cached.
-            tmp = target.with_suffix(".html.tmp")
-            tmp.write_text(html, encoding="utf-8")
-            tmp.replace(target)
+            write_thread_html(target, html)
             downloaded += 1
             await asyncio.sleep(delay)
 
@@ -222,7 +355,14 @@ async def async_main(args) -> int:
         raise RuntimeError(f"Could not read JSON config {config_path}: {exc}") from exc
 
     validate_forum_url(args.start_url)
-    output = Path(args.output).expanduser()
+    start = urlsplit(args.start_url)
+    is_mygully = start.hostname == MYGULLY_HOST
+    if is_mygully and not MYGULLY_SUBFORUM.fullmatch(start.path):
+        raise ValueError("Use a MyGully subforum URL such as https://mygully.com/forum/104-ha-rba-cher-und-ha-rspiele/")
+    if not is_mygully and not start.path.startswith("/members/"):
+        raise ValueError("Use a MyBoerse member profile URL.")
+    default_output = "archive/mygully.com" if is_mygully else "archive/myboerse"
+    output = Path(args.output or default_output).expanduser()
     output.mkdir(parents=True, exist_ok=True)
 
     async with AsyncCamoufox(headless=args.headless) as browser:
@@ -235,17 +375,14 @@ async def async_main(args) -> int:
         # page.set_default_timeout(15_000) # 15 seconds
         page.set_default_timeout(60_000) # 60 seconds
         try:
-            await login_if_needed(page, config)
-            path = urlparse(args.start_url).path
-            if path.startswith("/members/"):
-                await scrape_member(page, args.start_url, output, args.delay)
+            if is_mygully:
+                await login_mygully(page, config)
+                await scrape_mygully_subforum(page, args.start_url, output, args.delay)
             else:
-                raise NotImplementedError(
-                    "This first version implements member URLs only. Other start URL types "
-                    "are intentionally reserved for future handlers."
-                )
+                await login_if_needed(page, config)
+                await scrape_member(page, args.start_url, output, args.delay)
         except Exception as exc:
-            if 1:
+            if not is_mygully and not args.headless:
                 print(f"got exception: {type(exc).__name__}: {exc}")
                 print("keeping browser open for debugging")
                 await asyncio.sleep(99999)
@@ -258,8 +395,8 @@ async def async_main(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Path to JSON credentials config")
-    parser.add_argument("--start-url", required=True, help="Forum member URL to archive")
-    parser.add_argument("--output", default="archive/myboerse", help="HTML archive directory")
+    parser.add_argument("--start-url", required=True, help="MyBoerse member or MyGully subforum URL")
+    parser.add_argument("--output", help="HTML archive directory (default: archive/myboerse or archive/mygully.com)")
     parser.add_argument("--delay", type=float, default=1.5, help="Delay between thread downloads")
     parser.add_argument("--headless", action="store_true", help="Run browser headless (default: visible)")
     args = parser.parse_args()

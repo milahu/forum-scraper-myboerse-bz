@@ -1,6 +1,6 @@
-# MyBoerse thread archiver
+# MyBoerse and MyGully thread archiver
 
-Archives thread pages as HTML using Camoufox. The current implementation supports member profile URLs only.
+Archives thread pages as HTML using Camoufox. Use a MyBoerse member profile URL or a MyGully subforum URL.
 
 ## Setup
 
@@ -33,6 +33,16 @@ python myboerse_scraper.py \
   --output "./archive/thewooter"
 ```
 
+For MyGully, use your MyGully credentials in the config and pass the subforum URL with any filters you want to keep across listing pages.
+
+```bash
+python myboerse_scraper.py \
+  --config mygully-config.json \
+  --start-url 'https://mygully.com/forum/104-ha-rba-cher-und-ha-rspiele/?pp=50&daysprune=-1&prefixid=SachbuchEbooks'
+```
+
+MyGully archives default to `archive/mygully.com/<thread-id>.html`. MyBoerse archives default to `archive/myboerse/<thread-id>.html`.
+
 The browser is visible by default, which helps if the forum presents a challenge or additional login step. Use `--headless` only after confirming that login works in your environment.
 
 ## Cache behavior
@@ -41,10 +51,9 @@ Files are named `<thread-id>.html`. Existing files are never refreshed or overwr
 
 ## Scope and notes
 
-- The script follows the member page's own "find all threads" link, then follows XenForo search pagination.
-- It saves each thread page's HTML. Filecrypt links remain as links in that HTML; the script does not visit or download from Filecrypt.
-- Non-member start URLs intentionally raise `NotImplementedError` until a handler is implemented.
-- Forum markup and login behavior can change. If it reports no thread results, inspect the visible browser and update the XenForo selectors in `extract_thread_links()` / `find_next_page()`.
+- For MyBoerse, the script follows the member page's "find all threads" link and then XenForo search pagination.
+- For MyGully, the script follows the subforum's pagination and keeps the filters from the start URL.
+- Filehoster links remain in the archived HTML. The script opens only the forum listing and thread pages during scraping.
 - Use only for content you are authorized to access, and keep request rates modest.
 
 ## Limitations
