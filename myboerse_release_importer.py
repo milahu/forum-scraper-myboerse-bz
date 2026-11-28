@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
 """
-Parse archived MyBoerse release threads and optionally submit Filecrypt links to pyLoad.
+Parse archived MyBoerse and myGully threads and optionally submit downloads to pyLoad.
 
 It recursively parses `*.html` files,
 extracts the first bold/strong release title from `.message-body .bbWrapper`,
-falls back to the `<title>` prefix before `| MyBoerse.bz`,
-extracts all Filecrypt Container links,
+falls back to the page heading or title,
+extracts Rapidgator downloads and Filecrypt containers,
 and parses release metadata with GuessIt.
 Add custom rules in `filter_releases(releases, args)`.
 
@@ -16,6 +16,7 @@ matching releases are skipped on later runs.
 Failed submissions are not logged and will be retried.
 The history confirms pyLoad accepted the handler request, not that the downloads completed.
 Review candidates with `--dry-run` before submitting.
+Use `--select-link` once per URL to submit only those downloads or containers.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ beautifulsoup_html_parser = "lxml"
 
 LOG = logging.getLogger("myboerse_release_importer")
 FILECRYPT_HOSTS = {"filecrypt.cc", "www.filecrypt.cc"}
+RAPIDGATOR_HOSTS = {"rapidgator.net", "rg.to"}
 RAPIDGATOR_BADGE = "https://i.imgur.com/DrqaS42.png"
 DDOWNLOAD_BADGE = "https://i.imgur.com/lQ55QX4.png"
 
@@ -61,6 +63,12 @@ class Release:
     guessit: dict[str, Any] = field(default_factory=dict)
     filecrypt_hosters: dict[str, list[str]] = field(default_factory=dict)
     subforum: str | None = None
+    direct_links: list[str] = field(default_factory=list)
+
+    @property
+    def download_links(self) -> list[str]:
+        return self.direct_links + self.filecrypt_links
+
     @property
     def key(self) -> str:
         return f"t{self.thread_id}"
@@ -74,6 +82,16 @@ def clean_title(value: str) -> str:
 def is_filecrypt_container(url: str) -> bool:
     p = urlparse(url)
     return p.scheme in {"http", "https"} and (p.hostname or "").lower() in FILECRYPT_HOSTS and "/container/" in p.path.lower()
+
+
+def is_rapidgator_download(url: str) -> bool:
+    p = urlparse(url)
+    return (
+        p.scheme in {"http", "https"}
+        and (p.hostname or "").removeprefix("www.") in RAPIDGATOR_HOSTS
+        and p.path.startswith("/file/")
+        and bool(p.path.removeprefix("/file/"))
+    )
 
 
 def extract_thread_id(path: Path, soup: BeautifulSoup) -> int | None:
@@ -139,7 +157,7 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
 
     # <h1 class="p-title-value">Some Title</h1>
     h1_selector = "h1.p-title-value"
-    h1_tag = soup.select_one(h1_selector)
+    h1_tag = soup.select_one(h1_selector) or soup.select_one("h1")
     if h1_tag:
         # print(f"extract_release_title: h1_tag={h1_tag}")
         candidate = clean_title(h1_tag.get_text(" ", strip=True))
@@ -151,15 +169,19 @@ def extract_release_title(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     title_tag = soup.find("title")
     if title_tag:
         full = clean_title(title_tag.get_text(" ", strip=True))
-        candidate = clean_title(re.split(r"\s*\|\s*MyBoerse\.bz\b", full, maxsplit=1, flags=re.I)[0])
+        candidate = clean_title(re.sub(r"\s*(?:\|\s*MyBoerse\.bz|-\s*myGully\.com)$", "", full, flags=re.I))
         # print(f"extract_release_title: candidate={candidate!r}")
         if candidate: return candidate, "page-title"
     return None, None
 
-def extract_filecrypt_links(soup: BeautifulSoup) -> tuple[list[str], dict[str, list[str]]]:
+def extract_download_links(soup: BeautifulSoup) -> tuple[list[str], list[str], dict[str, list[str]]]:
     links: dict[str, set[str]] = {}
+    direct_links: dict[str, None] = {}
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
+        if is_rapidgator_download(href):
+            direct_links.setdefault(href, None)
+            continue
         if not is_filecrypt_container(href):
             continue
         hosters = links.setdefault(href, set())
@@ -168,7 +190,19 @@ def extract_filecrypt_links(soup: BeautifulSoup) -> tuple[list[str], dict[str, l
             hosters.add("ddownload.com")
         if RAPIDGATOR_BADGE in badges:
             hosters.add("rapidgator.net")
-    return list(links), {
+
+    for post in soup.select('[id^="post_message_"], .bbWrapper'):
+        for node in post.strings:
+            if node.find_parent("a"):
+                continue
+            for match in re.finditer(r"""https?://[^\s<>"']+""", node, flags=re.I):
+                url = match.group().rstrip(".,;!)]}")
+                if is_rapidgator_download(url):
+                    direct_links.setdefault(url, None)
+                elif is_filecrypt_container(url):
+                    links.setdefault(url, set())
+
+    return list(direct_links), list(links), {
         href: sorted(hosters)
         for href, hosters in links.items()
         if hosters
@@ -185,6 +219,9 @@ def extract_subforum(soup: BeautifulSoup) -> str | None:
             section = data.get("articleSection")
             if isinstance(section, str):
                 return section
+    breadcrumbs = soup.select('span.smallfont > a[href^="forumdisplay.php?f="]')
+    if breadcrumbs:
+        return clean_title(breadcrumbs[-1].get_text(" ", strip=True))
     return None
 
 
@@ -204,11 +241,11 @@ def parse_html_file(path: Path) -> Release | None:
     )
     if title in bad_titles: return None
     # print(f"parse_html_file: title={title!r}, source={source!r}")
-    links, hosters = extract_filecrypt_links(soup)
+    direct_links, links, hosters = extract_download_links(soup)
     if not title:
         LOG.warning("No release title found in %s", path); return None
-    if not links:
-        LOG.debug("No Filecrypt container link in %s", path); return None
+    if not links and not direct_links:
+        LOG.debug("No supported download links in %s", path); return None
     try: parsed = guessit(title); guessit_data = {str(k): str(v) for k, v in parsed.items()}
     except Exception:
         LOG.exception("GuessIt failed for %r", title); guessit_data = {}
@@ -223,10 +260,11 @@ def parse_html_file(path: Path) -> Release | None:
         guessit=guessit_data,
         filecrypt_hosters=hosters,
         subforum=extract_subforum(soup),
+        direct_links=direct_links,
     )
 
 
-HTML_PARSER_VERSION = 4
+HTML_PARSER_VERSION = 5
 
 
 def get_cached_release(
@@ -424,7 +462,8 @@ def load_history(path: Path) -> dict[str, dict[str, Any]]:
 def append_history(path: Path, release: Release, response: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"key": release.key, "title": release.title, "source_file": release.source_file,
-              "filecrypt_links": release.filecrypt_links, "pyload_response": response,
+              "filecrypt_links": release.filecrypt_links, "direct_links": release.direct_links,
+              "pyload_response": response,
               "added_at": datetime.now(timezone.utc).isoformat()}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -616,17 +655,25 @@ def filter_releases(
     ) -> list[Release]:
     selected = releases
 
-    if args.filehoster:
+    if args.filehoster or args.select_link:
+        selected_urls = set(args.select_link)
         selected = []
         for release in releases:
             links = [
                 url for url in release.filecrypt_links
-                if not release.filecrypt_hosters.get(url)
-                or args.filehoster in release.filecrypt_hosters[url]
+                if (not selected_urls or url in selected_urls)
+                and (not args.filehoster or not release.filecrypt_hosters.get(url)
+                     or args.filehoster in release.filecrypt_hosters[url])
             ]
-            if links:
+            direct_links = [
+                url for url in release.direct_links
+                if (not selected_urls or url in selected_urls)
+                and args.filehoster in (None, "rapidgator.net")
+            ]
+            if links or direct_links:
                 selected.append(replace(
                     release,
+                    direct_links=direct_links,
                     filecrypt_links=links,
                     filecrypt_hosters={
                         url: release.filecrypt_hosters[url]
@@ -811,16 +858,11 @@ def submit_resolved_release(
         history_path: Path,
         history: dict,
     ) -> None:
-    urls = unique(urls)
-
-    # filter URLs by hoster
-    def filter_fn(url):
-        return url.lower().startswith("https://rapidgator.net/")
-    urls = list(filter(filter_fn, urls))
+    urls = [url for url in unique(urls) if is_rapidgator_download(url)]
 
     if not urls:
         raise ValueError(
-            f"No decrypted URLs for {release.title}"
+            f"No Rapidgator download links for {release.title}"
         )
 
     response = submit_links_to_pyload(
@@ -876,7 +918,7 @@ def process_releases(
 
             state = {
                 "release": release,
-                "urls": [],
+                "urls": list(release.direct_links),
                 "remaining": 0,
                 "failed": False,
             }
@@ -904,7 +946,7 @@ def process_releases(
                 entry["package_names"].append(release.package_name)
                 entry["release_keys"].append(release.key)
 
-        # Submit fully cached releases without starting Firefox.
+        # Submit direct and fully cached releases without starting Firefox.
         for state in states.values():
             if state["remaining"] != 0:
                 continue
@@ -1006,6 +1048,7 @@ def normalize_filehoster(value: str) -> str:
     host = value.strip().casefold().removeprefix("www.")
     return {
         "rapidgator": "rapidgator.net",
+        "rg.to": "rapidgator.net",
         "ddownload": "ddownload.com",
         "ddl.to": "ddownload.com",
     }.get(host, host)
@@ -1034,7 +1077,14 @@ def main() -> int:
     p.add_argument(
         "--filehoster",
         type=normalize_filehoster,
-        help="Keep Filecrypt links for this host (e.g. rapidgator.net) and links with an unknown host",
+        help="Keep links for this host (e.g. rapidgator.net) and Filecrypt containers with an unknown host",
+    )
+    p.add_argument(
+        "--select-link",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="Keep this exact download or container URL (repeat for multiple URLs)",
     )
     p.add_argument("--dry-run", action="store_true", help="List candidates without submitting")
     p.add_argument("--passwords", help="Optional archive password string passed to pyLoad")
@@ -1103,6 +1153,11 @@ def main() -> int:
     if not archive.is_dir(): p.error(f"archive directory does not exist: {archive}")
     # Stage 1: parse the entire archive.
     releases = parse_archive(args)
+    if args.select_link:
+        available_urls = {url for release in releases for url in release.download_links}
+        missing_urls = [url for url in args.select_link if url not in available_urls]
+        if missing_urls:
+            p.error("selected URLs not found in parsed releases: " + ", ".join(missing_urls))
     if args.shuffle:
         # process releases in random order
         random.shuffle(releases)
@@ -1122,7 +1177,7 @@ def main() -> int:
     if args.limit and args.limit < len(pending):
         print(f"limiting pending releases from {len(pending)} to {args.limit}")
         pending = pending[:args.limit]
-    for r in pending: LOG.info("Candidate: %s | GuessIt=%s | links=%s", r.title, r.guessit, ", ".join(r.filecrypt_links))
+    for r in pending: LOG.info("Candidate: %s | GuessIt=%s | links=%s", r.title, r.guessit, ", ".join(r.download_links))
     if args.dry_run:
         LOG.info("Dry run: nothing submitted."); return 0
     r'''
