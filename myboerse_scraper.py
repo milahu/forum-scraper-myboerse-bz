@@ -75,8 +75,16 @@ async def login_mygully(page, config: dict) -> None:
 
 
 def mygully_page_number(url: str) -> int:
-    value = parse_qs(urlsplit(url).query).get("page", ["1"])[0]
-    return int(value) if re.fullmatch(r"[0-9]+", value) else 1
+    parsed = urlsplit(url)
+    value = parse_qs(parsed.query).get("page", [""])[0]
+    if re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    if MYGULLY_SUBFORUM.fullmatch(parsed.path):
+        # MyGully puts the page number at the end of the canonical listing slug.
+        suffix = re.search(r"-([0-9]+)/?$", parsed.path)
+        if suffix:
+            return int(suffix.group(1))
+    return 1
 
 
 async def mygully_next_page(page, current: str, start_url: str) -> str | None:
